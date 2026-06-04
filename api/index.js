@@ -15,7 +15,7 @@ app.use(express.json({ limit: '50mb' }));
 const firebaseConfig = {
   apiKey: process.env.FIREBASE_API_KEY,
   projectId: "zeytoon-belege",
-  databaseURL: "https://zeytoon-belege.firebaseio.com",
+  databaseURL: "https://zeytoon-belege-default-rtdb.europe-west1.firebasedatabase.app",
   authDomain: "zeytoon-belege.firebaseapp.com",
   storageBucket: "zeytoon-belege.appspot.com",
 };
