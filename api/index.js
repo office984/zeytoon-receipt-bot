@@ -6,6 +6,7 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import PDFDocument from 'pdfkit';
 
 dotenv.config();
 
@@ -53,6 +54,55 @@ function generateFileName(data) {
   const payment = (data.paymentMethod || 'unknown').replace(/[^a-zA-Z0-9_]/g, '_');
   const account = (data.account || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
   return `${date}_${supplier}_${payment}_${account}`;
+}
+
+// Helper: Create PDF from Image
+function createPdfFromImage(imagePath, pdfPath) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({
+        size: 'A4',
+        margin: 10
+      });
+
+      const stream = fs.createWriteStream(pdfPath);
+      
+      doc.pipe(stream);
+
+      // Get image dimensions
+      const img = doc.openImage(imagePath);
+      const pageWidth = doc.page.width - 20;
+      const pageHeight = doc.page.height - 20;
+      
+      // Scale image to fit page
+      let width = img.width;
+      let height = img.height;
+      
+      if (width > pageWidth) {
+        const ratio = pageWidth / width;
+        width = pageWidth;
+        height = height * ratio;
+      }
+      
+      if (height > pageHeight) {
+        const ratio = pageHeight / height;
+        height = pageHeight;
+        width = width * ratio;
+      }
+
+      // Center image on page
+      const x = (doc.page.width - width) / 2;
+      const y = (doc.page.height - height) / 2;
+
+      doc.image(imagePath, x, y, { width, height });
+      doc.end();
+
+      stream.on('finish', resolve);
+      stream.on('error', reject);
+    } catch (error) {
+      reject(error);
+    }
+  });
 }
 
 // Commands
@@ -305,6 +355,8 @@ bot.action('account_private', async (ctx) => {
 // Process Invoice
 async function processInvoice(ctx, userId, session) {
   try {
+    ctx.reply('⏳ Verarbeite Rechnung...');
+
     const fileName = generateFileName({
       supplier: session.supplier,
       paymentMethod: session.paymentMethod,
@@ -318,17 +370,23 @@ async function processInvoice(ctx, userId, session) {
     // Download file
     const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
     const fileExtension = file.file_path.split('.').pop();
-    const localPath = path.join(tempDir, `${fileName}.${fileExtension}`);
+    const originalPath = path.join(tempDir, `${fileName}.${fileExtension}`);
+    const pdfPath = path.join(tempDir, `${fileName}.pdf`);
     
-    // Save file
-    fs.writeFileSync(localPath, response.data);
+    // Save original file
+    fs.writeFileSync(originalPath, response.data);
     
-    // Send file back to group
-    const fileStream = fs.createReadStream(localPath);
+    // Create PDF from image if it's a photo
+    if (session.type === 'photo') {
+      await createPdfFromImage(originalPath, pdfPath);
+    }
+
+    // Send original file
+    const originalStream = fs.createReadStream(originalPath);
     await ctx.telegram.sendDocument(
       session.chatId,
       {
-        source: fileStream,
+        source: originalStream,
         filename: `${fileName}.${fileExtension}`
       },
       {
@@ -336,8 +394,26 @@ async function processInvoice(ctx, userId, session) {
       }
     );
 
+    // Send PDF if created
+    if (session.type === 'photo' && fs.existsSync(pdfPath)) {
+      const pdfStream = fs.createReadStream(pdfPath);
+      await ctx.telegram.sendDocument(
+        session.chatId,
+        {
+          source: pdfStream,
+          filename: `${fileName}.pdf`
+        },
+        {
+          caption: `📑 PDF-Version`
+        }
+      );
+    }
+
     // Clean up
-    fs.unlinkSync(localPath);
+    fs.unlinkSync(originalPath);
+    if (fs.existsSync(pdfPath)) {
+      fs.unlinkSync(pdfPath);
+    }
 
     ctx.answerCbQuery('✅ Fertig!');
     delete userSessions[userId];
