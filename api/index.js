@@ -903,6 +903,29 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Diagnose: prüft pro Service Vision-Key + Konfiguration (zeigt KEINE Geheimwerte)
+app.get('/api/diag', async (req, res) => {
+  const out = {
+    visionKeyLen: (process.env.GOOGLE_VISION_API_KEY || '').length,
+    dbSecretLen: (process.env.FIREBASE_DB_SECRET || '').length,
+    dbUrl: process.env.FIREBASE_DATABASE_URL || '(leer)',
+    webhookEnv: process.env.WEBHOOK_URL || '(leer)'
+  };
+  try {
+    const r = await axios.post(
+      `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GOOGLE_VISION_API_KEY}`,
+      { requests: [{ image: { content: 'dGVzdA==' }, features: [{ type: 'TEXT_DETECTION' }] }] },
+      { validateStatus: () => true }
+    );
+    out.visionStatus = r.status;
+    out.visionInfo = r.data?.error?.message?.slice(0, 140) || (r.data?.responses ? 'Key OK (Bad-Image erwartet)' : 'unbekannt');
+  } catch (e) {
+    out.visionStatus = 'EXC';
+    out.visionInfo = e.message;
+  }
+  res.json(out);
+});
+
 // Manueller/externer Trigger für den Monatsbericht (z.B. Railway Cron am 1.)
 app.get('/api/cron/monthly', async (req, res) => {
   if (process.env.CRON_KEY && req.query.key !== process.env.CRON_KEY) {
