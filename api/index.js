@@ -277,7 +277,20 @@ function askForSupplier(ctx, userId) {
   });
 }
 
-bot.action(/supplier_/, async (ctx) => {
+bot.action('supplier_other', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  ctx.reply('📝 Schreib den Namen des neuen Lieferanten:');
+  session.waitingForSupplier = true;
+});
+
+bot.action(/^supplier_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -285,15 +298,16 @@ bot.action(/supplier_/, async (ctx) => {
     return;
   }
 
-  const action = ctx.match[0];
-  if (action === 'supplier_other') {
-    ctx.reply('📝 Schreib den Namen des neuen Lieferanten:');
-    session.waitingForSupplier = true;
-  } else {
-    const index = parseInt(action.split('_')[1]);
-    session.supplier = SUPPLIERS[index].name;
-    askForPayment(ctx, userId);
+  const index = parseInt(ctx.match[1], 10);
+  const supplier = SUPPLIERS[index];
+  if (!supplier) {
+    ctx.reply('❌ Unbekannter Lieferant, bitte erneut wählen.');
+    askForSupplier(ctx, userId);
+    return;
   }
+
+  session.supplier = supplier.name;
+  askForPayment(ctx, userId);
 });
 
 // Text-Handler (für "Sonstiges")
@@ -330,7 +344,8 @@ function askForPayment(ctx, userId) {
   });
 }
 
-bot.action('payment_cash', (ctx) => {
+bot.action('payment_cash', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -341,7 +356,8 @@ bot.action('payment_cash', (ctx) => {
   askForAccount(ctx, userId);
 });
 
-bot.action('payment_card', (ctx) => {
+bot.action('payment_card', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -360,7 +376,8 @@ bot.action('payment_card', (ctx) => {
   });
 });
 
-bot.action('card_bawag', (ctx) => {
+bot.action('card_bawag', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -371,7 +388,8 @@ bot.action('card_bawag', (ctx) => {
   askForAccount(ctx, userId);
 });
 
-bot.action('card_n26', (ctx) => {
+bot.action('card_n26', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -397,6 +415,7 @@ function askForAccount(ctx, userId) {
 }
 
 bot.action('account_business', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
@@ -408,6 +427,7 @@ bot.action('account_business', async (ctx) => {
 });
 
 bot.action('account_private', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
   const session = userSessions[userId];
   if (!session) {
