@@ -895,7 +895,12 @@ app.post('/api/webhook', express.json(), async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt' });
+  res.json({
+    status: 'ok',
+    version: '2026-06-05-crop-nr',
+    features: ['ocr', 'crop', 'receiptNr', 'ueberwiesen'],
+    firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt'
+  });
 });
 
 // Manueller/externer Trigger für den Monatsbericht (z.B. Railway Cron am 1.)
