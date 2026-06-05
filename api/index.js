@@ -38,11 +38,11 @@ function generateFileName(data) {
 
 // Commands
 bot.start((ctx) => {
-  ctx.reply('👋 Willkommen!\n\n📸 Lade ein Rechnungs-Foto hoch und ich benenne es für dich!');
+  ctx.reply('👋 Willkommen!\n\n📸 Lade ein Rechnungs-Foto oder PDF hoch und ich benenne es für dich!');
 });
 
 bot.help((ctx) => {
-  ctx.reply('📸 Einfach ein Foto hochladen!');
+  ctx.reply('📸 Foto oder PDF hochladen!');
 });
 
 // Photo Handler
@@ -56,7 +56,8 @@ bot.on('photo', async (ctx) => {
       fileId,
       chatId: ctx.chat.id,
       messageId: ctx.message.message_id,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      type: 'photo'
     };
 
     ctx.reply(
@@ -73,6 +74,36 @@ bot.on('photo', async (ctx) => {
   }
 });
 
+// Document Handler (für PDFs)
+bot.on('document', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  try {
+    const fileId = ctx.message.document.file_id;
+    
+    userSessions[userId] = {
+      fileId,
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      fileName: ctx.message.document.file_name,
+      timestamp: new Date().toISOString(),
+      type: 'document'
+    };
+
+    ctx.reply(
+      '🏪 Von welchem Lieferant stammt die Rechnung?\n\nSchreib den Namen:',
+      {
+        reply_markup: {
+          force_reply: true
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Document error:', error);
+    ctx.reply('❌ Fehler bei der Verarbeitung');
+  }
+});
+
 // Text Handler
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
@@ -80,7 +111,7 @@ bot.on('text', async (ctx) => {
   const session = userSessions[userId];
 
   if (!session) {
-    ctx.reply('📸 Bitte lade erst ein Foto hoch!');
+    ctx.reply('📸 Bitte lade erst ein Foto oder PDF hoch!');
     return;
   }
 
@@ -175,7 +206,7 @@ bot.action('account_private', async (ctx) => {
   await processInvoice(ctx, userId, session);
 });
 
-// Process and rename photo
+// Process and rename photo/document
 async function processInvoice(ctx, userId, session) {
   try {
     const fileName = generateFileName({
