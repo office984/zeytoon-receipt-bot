@@ -124,7 +124,53 @@ async function ocrImage(base64) {
     ]
   });
   const res = data.responses?.[0];
-  return res?.fullTextAnnotation?.text || res?.textAnnotations?.[0]?.description || '';
+  const text = res?.fullTextAnnotation?.text || res?.textAnnotations?.[0]?.description || '';
+
+  // Bounding-Box über den GESAMTEN erkannten Text = ungefähr die Rechnung
+  let bbox = null;
+  const verts = res?.textAnnotations?.[0]?.boundingPoly?.vertices;
+  if (verts && verts.length) {
+    const xs = verts.map((v) => v.x || 0);
+    const ys = verts.map((v) => v.y || 0);
+    bbox = { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
+  }
+  return { text, bbox };
+}
+
+// Bild auf den Rechnungs-Bereich zuschneiden (Hintergrund weg). Fällt bei Fehler auf Original zurück.
+async function cropToReceipt(buffer, bbox) {
+  if (!bbox) return buffer;
+  let sharp;
+  try {
+    sharp = (await import('sharp')).default;
+  } catch (error) {
+    console.error('sharp nicht verfügbar – kein Zuschnitt:', error.message);
+    return buffer;
+  }
+  try {
+    const img = sharp(buffer);
+    const meta = await img.metadata();
+    const W = meta.width;
+    const H = meta.height;
+    if (!W || !H) return buffer;
+
+    const padX = Math.round((bbox.maxX - bbox.minX) * 0.05);
+    const padY = Math.round((bbox.maxY - bbox.minY) * 0.05);
+    const left = Math.max(0, bbox.minX - padX);
+    const top = Math.max(0, bbox.minY - padY);
+    const right = Math.min(W, bbox.maxX + padX);
+    const bottom = Math.min(H, bbox.maxY + padY);
+    const width = right - left;
+    const height = bottom - top;
+
+    // Sicherheits-Check: kein sinnloser Mini-Zuschnitt
+    if (width < 40 || height < 40 || width * height < W * H * 0.05) return buffer;
+
+    return await img.extract({ left, top, width, height }).toBuffer();
+  } catch (error) {
+    console.error('Zuschnitt fehlgeschlagen:', error.message);
+    return buffer;
+  }
 }
 
 // OCR für PDFs (synchron, bis 5 Seiten) über Google Vision files:annotate
@@ -488,7 +534,9 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
   try {
     const base64 = buffer.toString('base64');
     if (meta.isImage) {
-      text = await ocrImage(base64);
+      const r = await ocrImage(base64);
+      text = r.text;
+      session.cropBox = r.bbox;
     } else if (meta.isPdf) {
       text = await ocrPdf(base64);
     }
@@ -757,9 +805,10 @@ async function processInvoice(ctx, userId, session) {
     const pdfPath = path.join(tempDir, `${fileName}.pdf`);
 
     if (session.isImage) {
-      // Bild -> PDF erzeugen
+      // Bild auf Rechnungs-Bereich zuschneiden, dann -> PDF
+      const cropped = await cropToReceipt(session.buffer, session.cropBox);
       const originalPath = path.join(tempDir, `${fileName}.${session.ext}`);
-      fs.writeFileSync(originalPath, session.buffer);
+      fs.writeFileSync(originalPath, cropped);
       await createPdfFromImage(originalPath, pdfPath);
       fs.unlinkSync(originalPath);
     } else if (session.isPdf) {
