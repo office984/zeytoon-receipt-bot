@@ -214,16 +214,47 @@ function parseAmount(s) {
 // Geldbeträge im Text finden (europäisches Format bevorzugt)
 const MONEY_REGEX = /\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+,\d{2}|\d+\.\d{2}/g;
 
+// Zeile besteht im Wesentlichen nur aus einem Geldbetrag (z.B. "125.12", "1.376,35", "€ 12,50")
+function isMoneyLine(line) {
+  return /^\s*€?\s*\d[\d.\s]*[.,]\d{2}\s*$/.test(line);
+}
+
 // Best-effort: bezahlte MwSt aus OCR-Text lesen. Gibt Number oder null.
 function detectVat(text) {
   if (!text) return null;
-  const lines = text.split(/\r?\n/);
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+
+  // 1) Tabellen-Format (AT-Kassenbons): Kopfzeile "Brutto Netto MwSt",
+  //    danach Summen-Zeile mit drei Werten -> MwSt ist der kleinste.
+  const headerIdx = lines.findIndex(
+    (l) => /brutto/i.test(l) && /netto/i.test(l) && /mwst/i.test(l)
+  );
+  if (headerIdx >= 0) {
+    let sumIdx = -1;
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      if (/\bsumme\b/i.test(lines[i])) { sumIdx = i; break; }
+    }
+    const start = sumIdx >= 0 ? sumIdx + 1 : headerIdx + 1;
+    const amounts = [];
+    for (let i = start; i < lines.length; i++) {
+      const l = lines[i];
+      if (isMoneyLine(l)) {
+        const v = parseAmount(l.replace(/[€\s]/g, ''));
+        if (!isNaN(v)) amounts.push(v);
+      } else if (amounts.length) {
+        break; // Zahlenblock zu Ende
+      } else if (/%/.test(l) || l === '' || /^\d+$/.test(l)) {
+        continue; // Rate / Leerzeile / einzelne Ziffer überspringen
+      }
+    }
+    if (amounts.length) return Math.min(...amounts);
+  }
+
+  // 2) Fallback: Zeile mit MwSt-Stichwort + Betrag auf derselben Zeile
   const vatKey = /(mwst|mw\.?\s?st|u\.?\s?st\b|ust|mehrwertsteuer|m\.?w\.?s\.?t)/i;
   const totalKey = /(gesamt|summe|total)/i;
-
   const totals = [];
   const rates = [];
-
   for (const raw of lines) {
     const line = raw.toLowerCase();
     if (!vatKey.test(line)) continue;
@@ -234,7 +265,6 @@ function detectVat(text) {
     if (totalKey.test(line)) totals.push(val);
     else rates.push(val);
   }
-
   if (totals.length) return Math.max(...totals);
   if (rates.length) return Math.round(rates.reduce((a, b) => a + b, 0) * 100) / 100;
   return null;
