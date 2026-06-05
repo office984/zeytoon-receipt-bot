@@ -50,6 +50,22 @@ console.log('🤖 Bot initialized');
 
 // ---------- Helpers ----------
 
+// ctx.reply, das die Message-ID merkt, damit sie am Ende gelöscht werden kann
+async function trackReply(ctx, session, text, extra) {
+  const msg = await ctx.reply(text, extra);
+  if (session) session.botMessages.push(msg.message_id);
+  return msg;
+}
+
+// Alle Zwischen-Nachrichten + das hochgeladene Original löschen -> nur PDF bleibt
+async function cleanupMessages(ctx, session) {
+  const ids = [...(session.botMessages || [])];
+  if (session.userMessageId) ids.push(session.userMessageId);
+  for (const id of ids) {
+    await ctx.telegram.deleteMessage(session.chatId, id).catch(() => {});
+  }
+}
+
 // Text normalisieren: klein, ohne Akzente, einfache Leerzeichen
 function normalize(str) {
   return (str || '')
@@ -182,7 +198,7 @@ bot.start((ctx) => {
 });
 
 bot.help((ctx) => {
-  ctx.reply('📸 Foto oder PDF hochladen. Ich erkenne den Lieferanten selbst und frage nur noch nach Zahlungsart & Konto.');
+  ctx.reply('📸 Foto oder PDF hochladen. Ich erkenne den Lieferanten selbst und frage nur noch nach der Zahlungsart.');
 });
 
 // ---------- Eingang: Foto ----------
@@ -219,20 +235,21 @@ bot.on('document', async (ctx) => {
 
 // Gemeinsame Verarbeitung: Download -> OCR -> Lieferant erkennen
 async function handleIncomingFile(ctx, userId, fileId, meta) {
-  await ctx.reply('🔍 Lese Rechnung...');
-
-  const { buffer, ext } = await downloadTelegramFile(ctx, fileId);
-
   userSessions[userId] = {
     fileId,
     chatId: ctx.chat.id,
+    userMessageId: ctx.message.message_id,
+    botMessages: [],
     timestamp: new Date().toISOString(),
-    buffer,
-    ext,
     ...meta
   };
-
   const session = userSessions[userId];
+
+  await trackReply(ctx, session, '🔍 Lese Rechnung...');
+
+  const { buffer, ext } = await downloadTelegramFile(ctx, fileId);
+  session.buffer = buffer;
+  session.ext = ext;
 
   // OCR ausführen (Fehler -> trotzdem manuell weiter)
   let text = '';
@@ -252,16 +269,17 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
 
   if (supplier) {
     session.supplier = supplier;
-    await ctx.reply(`✅ Lieferant erkannt: *${supplier}*`, { parse_mode: 'Markdown' });
+    await trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*`, { parse_mode: 'Markdown' });
     askForPayment(ctx, userId);
   } else {
-    await ctx.reply('🤔 Lieferant konnte nicht automatisch erkannt werden.');
+    await trackReply(ctx, session, '🤔 Lieferant konnte nicht automatisch erkannt werden.');
     askForSupplier(ctx, userId);
   }
 }
 
 // ---------- Lieferant manuell (Fallback) ----------
 function askForSupplier(ctx, userId) {
+  const session = userSessions[userId];
   const buttons = [];
   for (let i = 0; i < SUPPLIERS.length; i += 2) {
     const row = [{ text: SUPPLIERS[i].name, callback_data: `supplier_${i}` }];
@@ -272,7 +290,7 @@ function askForSupplier(ctx, userId) {
   }
   buttons.push([{ text: 'Sonstiges ➕', callback_data: 'supplier_other' }]);
 
-  ctx.reply('🏪 Welcher Lieferant?', {
+  trackReply(ctx, session, '🏪 Welcher Lieferant?', {
     reply_markup: { inline_keyboard: buttons }
   });
 }
@@ -285,7 +303,7 @@ bot.action('supplier_other', async (ctx) => {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  ctx.reply('📝 Schreib den Namen des neuen Lieferanten:');
+  trackReply(ctx, session, '📝 Schreib den Namen des neuen Lieferanten:');
   session.waitingForSupplier = true;
 });
 
@@ -323,6 +341,8 @@ bot.on('text', async (ctx) => {
   if (session.waitingForSupplier) {
     session.supplier = ctx.message.text;
     session.waitingForSupplier = false;
+    // die getippte Antwort des Users auch wieder aufräumen
+    session.botMessages.push(ctx.message.message_id);
     askForPayment(ctx, userId);
     return;
   }
@@ -332,7 +352,8 @@ bot.on('text', async (ctx) => {
 
 // ---------- Zahlungsart ----------
 function askForPayment(ctx, userId) {
-  ctx.reply('💰 Wie wurde bezahlt?', {
+  const session = userSessions[userId];
+  trackReply(ctx, session, '💰 Wie wurde bezahlt?', {
     reply_markup: {
       inline_keyboard: [
         [
@@ -353,7 +374,8 @@ bot.action('payment_cash', async (ctx) => {
     return;
   }
   session.paymentMethod = 'Bar';
-  askForAccount(ctx, userId);
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
 });
 
 bot.action('payment_card', async (ctx) => {
@@ -364,7 +386,7 @@ bot.action('payment_card', async (ctx) => {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  ctx.reply('🏦 Welche Karte?', {
+  trackReply(ctx, session, '🏦 Welche Karte?', {
     reply_markup: {
       inline_keyboard: [
         [
@@ -385,7 +407,8 @@ bot.action('card_bawag', async (ctx) => {
     return;
   }
   session.paymentMethod = 'Karte_BAWAG';
-  askForAccount(ctx, userId);
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
 });
 
 bot.action('card_n26', async (ctx) => {
@@ -397,51 +420,15 @@ bot.action('card_n26', async (ctx) => {
     return;
   }
   session.paymentMethod = 'Karte_N26';
-  askForAccount(ctx, userId);
-});
-
-// ---------- Konto ----------
-function askForAccount(ctx, userId) {
-  ctx.reply('🏦 Von welchem Konto?', {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: 'Geschäftskonto', callback_data: 'account_business' },
-          { text: 'Privat', callback_data: 'account_private' }
-        ]
-      ]
-    }
-  });
-}
-
-bot.action('account_business', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
-  if (!session) {
-    ctx.reply('❌ Sitzung abgelaufen');
-    return;
-  }
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
-});
-
-bot.action('account_private', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
-  if (!session) {
-    ctx.reply('❌ Sitzung abgelaufen');
-    return;
-  }
-  session.account = 'Privat';
   await processInvoice(ctx, userId, session);
 });
 
 // ---------- Rechnung fertigstellen ----------
 async function processInvoice(ctx, userId, session) {
   try {
-    ctx.reply('⏳ Verarbeite Rechnung...');
+    const processingMsg = await ctx.reply('⏳ Verarbeite Rechnung...');
+    session.botMessages.push(processingMsg.message_id);
 
     const fileName = generateFileName({
       supplier: session.supplier,
@@ -449,53 +436,59 @@ async function processInvoice(ctx, userId, session) {
       account: session.account
     });
 
-    const originalPath = path.join(tempDir, `${fileName}.${session.ext}`);
     const pdfPath = path.join(tempDir, `${fileName}.pdf`);
 
-    // Buffer aus der Session speichern (kein erneuter Download nötig)
-    fs.writeFileSync(originalPath, session.buffer);
-
-    // PDF aus Bild erzeugen (Foto oder Bild-Dokument)
     if (session.isImage) {
+      // Bild -> PDF erzeugen
+      const originalPath = path.join(tempDir, `${fileName}.${session.ext}`);
+      fs.writeFileSync(originalPath, session.buffer);
       await createPdfFromImage(originalPath, pdfPath);
-    }
-
-    // Original senden
-    await ctx.telegram.sendDocument(
-      session.chatId,
-      { source: fs.createReadStream(originalPath), filename: `${fileName}.${session.ext}` },
-      {
-        caption:
-          `✅ Rechnung verarbeitet!\n\n` +
-          `📄 ${fileName}\n` +
-          `🏪 ${session.supplier}\n` +
-          `💰 ${session.paymentMethod}\n` +
-          `🏦 ${session.account}`
-      }
-    );
-
-    // PDF senden, falls aus Bild erzeugt
-    if (session.isImage && fs.existsSync(pdfPath)) {
+      fs.unlinkSync(originalPath);
+    } else if (session.isPdf) {
+      // schon ein PDF -> nur umbenannt speichern
+      fs.writeFileSync(pdfPath, session.buffer);
+    } else {
+      // unbekannter Typ -> Original mit eigener Endung senden
+      const otherPath = path.join(tempDir, `${fileName}.${session.ext}`);
+      fs.writeFileSync(otherPath, session.buffer);
       await ctx.telegram.sendDocument(
         session.chatId,
-        { source: fs.createReadStream(pdfPath), filename: `${fileName}.pdf` },
-        { caption: '📑 PDF-Version' }
+        { source: fs.createReadStream(otherPath), filename: `${fileName}.${session.ext}` },
+        { caption: buildCaption(fileName, session) }
       );
+      fs.unlinkSync(otherPath);
+      await cleanupMessages(ctx, session);
+      delete userSessions[userId];
+      return;
     }
 
-    // Aufräumen
-    fs.unlinkSync(originalPath);
-    if (fs.existsSync(pdfPath)) {
-      fs.unlinkSync(pdfPath);
-    }
+    // Nur die fertige PDF senden
+    await ctx.telegram.sendDocument(
+      session.chatId,
+      { source: fs.createReadStream(pdfPath), filename: `${fileName}.pdf` },
+      { caption: buildCaption(fileName, session) }
+    );
 
-    ctx.answerCbQuery('✅ Fertig!').catch(() => {});
+    fs.unlinkSync(pdfPath);
+
+    // Alle Zwischen-Nachrichten + Original-Upload löschen -> nur PDF bleibt
+    await cleanupMessages(ctx, session);
+
     delete userSessions[userId];
   } catch (error) {
     console.error('Process error:', error);
     ctx.reply('❌ Fehler beim Verarbeiten');
     delete userSessions[userId];
   }
+}
+
+function buildCaption(fileName, session) {
+  return (
+    `✅ Rechnung verarbeitet!\n\n` +
+    `📄 ${fileName}\n` +
+    `🏪 ${session.supplier}\n` +
+    `💰 ${session.paymentMethod}`
+  );
 }
 
 // ---------- Server / Webhook ----------
