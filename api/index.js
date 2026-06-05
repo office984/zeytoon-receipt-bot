@@ -755,8 +755,13 @@ app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
   try {
     const webhookUrl = process.env.WEBHOOK_URL;
-    await bot.telegram.setWebhook(webhookUrl);
-    console.log('✅ Webhook set!');
+    if (webhookUrl && /^https:\/\/.+/.test(webhookUrl)) {
+      await bot.telegram.setWebhook(webhookUrl);
+      console.log('✅ Webhook set!');
+    } else {
+      // Leere/ungültige URL würde den bestehenden Webhook löschen -> nicht anfassen
+      console.log('⚠️ WEBHOOK_URL fehlt/ungültig – bestehender Webhook bleibt unverändert.');
+    }
   } catch (error) {
     console.log(`⚠️ Webhook: ${error.message}`);
   }
