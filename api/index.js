@@ -738,7 +738,40 @@ bot.action('payment_transfer', async (ctx) => {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  session.paymentMethod = 'Ueberwiesen';
+  trackReply(ctx, session, '🏦 Von welchem Konto überwiesen?', {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'BAWAG', callback_data: 'transfer_bawag' },
+          { text: 'N26', callback_data: 'transfer_n26' }
+        ]
+      ]
+    }
+  });
+});
+
+bot.action('transfer_bawag', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Ueberwiesen_BAWAG';
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
+});
+
+bot.action('transfer_n26', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Ueberwiesen_N26';
   session.account = 'Geschaeftskonto';
   await processInvoice(ctx, userId, session);
 });
