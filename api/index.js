@@ -157,8 +157,9 @@ function generateFileName(data) {
   const date = data.date || new Date().toISOString().split('T')[0];
   const supplier = (data.supplier || 'unknown').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
   const payment = (data.paymentMethod || 'unknown').replace(/[^a-zA-Z0-9_]/g, '_');
-  const account = (data.account || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
-  return `${date}_${supplier}_${payment}_${account}`;
+  // Statt Konto kommt die Beleg-Nr. ans Ende (Karte BAWAG/N26 bleibt im payment-Teil)
+  const belegNr = (data.receiptNumber || 'ohneNr').replace(/[^a-zA-Z0-9]/g, '');
+  return `${date}_${supplier}_${payment}_${belegNr}`;
 }
 
 // PDF aus Bild erstellen
@@ -276,6 +277,14 @@ function euro(n) {
   return n.toFixed(2).replace('.', ',') + ' €';
 }
 
+// Beleg-/Rechnungsnummer aus OCR-Text lesen. Gibt String oder null.
+function detectReceiptNumber(text) {
+  if (!text) return null;
+  const re = /\b(beleg|bon|rechnung|rg|quittung)s?[\s.\-]*(nr|nummer|no|number)?\.?\s*:?\s*#?\s*(\d{3,})/i;
+  const m = text.match(re);
+  return m ? m[3] : null;
+}
+
 // Rechnungsdatum aus OCR-Text lesen (TT.MM.JJJJ / TT/MM/JJJJ / TT.MM.JJ). Gibt 'YYYY-MM-DD' oder null.
 function detectDate(text) {
   if (!text) return null;
@@ -325,6 +334,17 @@ async function loadInvoices() {
     console.error('Firebase load error:', error.response?.status || error.message);
     return {};
   }
+}
+
+// Sucht einen bereits gespeicherten Beleg mit gleicher Beleg-Nr. im selben Chat.
+async function findDuplicate(chatId, receiptNumber) {
+  if (!receiptNumber) return null;
+  const inv = await loadInvoices();
+  return (
+    Object.values(inv || {}).find(
+      (r) => r && r.chatId === chatId && r.receiptNumber === receiptNumber
+    ) || null
+  );
 }
 
 async function wasSummaryPosted(chatId, month) {
@@ -487,17 +507,71 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
   session.extractedText = text;
   session.vat = detectVat(text);
   session.invoiceDate = detectDate(text);
-  const supplier = matchSupplier(text);
+  session.receiptNumber = detectReceiptNumber(text);
 
+  // Doppelten Beleg erkennen (anhand Beleg-Nr. im selben Chat)
+  const dup = await findDuplicate(session.chatId, session.receiptNumber);
+  if (dup) {
+    await trackReply(
+      ctx,
+      session,
+      `⚠️ *Achtung – Beleg evtl. doppelt!*\n` +
+        `Beleg-Nr. ${session.receiptNumber} wurde bereits erfasst` +
+        `${dup.invoiceDate ? ` (Datum ${dup.invoiceDate})` : ''}.\n\nTrotzdem verarbeiten?`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Ja, trotzdem ✅', callback_data: 'dup_continue' },
+              { text: 'Abbrechen ❌', callback_data: 'dup_cancel' }
+            ]
+          ]
+        }
+      }
+    );
+    return; // auf Entscheidung des Users warten
+  }
+
+  proceedAfterOcr(ctx, userId);
+}
+
+// Lieferant erkennen (oder fragen) und weiter zur Zahlungsart
+function proceedAfterOcr(ctx, userId) {
+  const session = userSessions[userId];
+  if (!session) return;
+  const supplier = matchSupplier(session.extractedText);
   if (supplier) {
     session.supplier = supplier;
-    await trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*`, { parse_mode: 'Markdown' });
+    trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*`, { parse_mode: 'Markdown' });
     askForPayment(ctx, userId);
   } else {
-    await trackReply(ctx, session, '🤔 Lieferant konnte nicht automatisch erkannt werden.');
+    trackReply(ctx, session, '🤔 Lieferant konnte nicht automatisch erkannt werden.');
     askForSupplier(ctx, userId);
   }
 }
+
+// Duplikat-Entscheidung
+bot.action('dup_continue', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  proceedAfterOcr(ctx, userId);
+});
+
+bot.action('dup_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) return;
+  await trackReply(ctx, session, '❌ Abgebrochen – Beleg wurde nicht erneut verarbeitet.');
+  await cleanupMessages(ctx, session);
+  delete userSessions[userId];
+});
 
 // ---------- Lieferant manuell (Fallback) ----------
 function askForSupplier(ctx, userId) {
@@ -659,8 +733,8 @@ async function processInvoice(ctx, userId, session) {
     const fileName = generateFileName({
       supplier: session.supplier,
       paymentMethod: session.paymentMethod,
-      account: session.account,
-      date: session.invoiceDate
+      date: session.invoiceDate,
+      receiptNumber: session.receiptNumber
     });
 
     const pdfPath = path.join(tempDir, `${fileName}.pdf`);
@@ -719,6 +793,9 @@ function buildCaption(fileName, session) {
     `📄 ${fileName}\n` +
     `🏪 ${session.supplier}\n` +
     `💰 ${session.paymentMethod}`;
+  if (session.receiptNumber) {
+    caption += `\n🧾 Beleg-Nr.: ${session.receiptNumber}`;
+  }
   if (typeof session.vat === 'number') {
     caption += `\n💶 MwSt (erkannt): ${euro(session.vat)}`;
   }
@@ -734,6 +811,7 @@ async function persistInvoice(session) {
     paymentMethod: session.paymentMethod,
     vat: typeof session.vat === 'number' ? session.vat : null,
     invoiceDate: session.invoiceDate || null,
+    receiptNumber: session.receiptNumber || null,
     month,
     createdAt: new Date().toISOString()
   });
