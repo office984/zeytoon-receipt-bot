@@ -153,7 +153,8 @@ async function downloadTelegramFile(ctx, fileId) {
 
 // Dateiname erzeugen
 function generateFileName(data) {
-  const date = new Date().toISOString().split('T')[0];
+  // Rechnungsdatum vom Beleg, sonst heutiges Datum
+  const date = data.date || new Date().toISOString().split('T')[0];
   const supplier = (data.supplier || 'unknown').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
   const payment = (data.paymentMethod || 'unknown').replace(/[^a-zA-Z0-9_]/g, '_');
   const account = (data.account || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
@@ -273,6 +274,23 @@ function detectVat(text) {
 function euro(n) {
   if (n === null || n === undefined || isNaN(n)) return '—';
   return n.toFixed(2).replace('.', ',') + ' €';
+}
+
+// Rechnungsdatum aus OCR-Text lesen (TT.MM.JJJJ / TT/MM/JJJJ / TT.MM.JJ). Gibt 'YYYY-MM-DD' oder null.
+function detectDate(text) {
+  if (!text) return null;
+  const re = /\b(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{2,4})\b/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let d = parseInt(m[1], 10);
+    let mo = parseInt(m[2], 10);
+    let y = parseInt(m[3], 10);
+    if (y < 100) y += 2000;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+    if (y < 2020 || y > 2035) continue;
+    return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+  return null;
 }
 
 // ---------- Zeit-Helfer ----------
@@ -468,6 +486,7 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
 
   session.extractedText = text;
   session.vat = detectVat(text);
+  session.invoiceDate = detectDate(text);
   const supplier = matchSupplier(text);
 
   if (supplier) {
@@ -640,7 +659,8 @@ async function processInvoice(ctx, userId, session) {
     const fileName = generateFileName({
       supplier: session.supplier,
       paymentMethod: session.paymentMethod,
-      account: session.account
+      account: session.account,
+      date: session.invoiceDate
     });
 
     const pdfPath = path.join(tempDir, `${fileName}.pdf`);
@@ -706,12 +726,15 @@ function buildCaption(fileName, session) {
 }
 
 async function persistInvoice(session) {
+  // Monat nach Rechnungsdatum (für korrekte Monats-Zusammenfassung), sonst heute
+  const month = session.invoiceDate ? session.invoiceDate.slice(0, 7) : monthKeyOf(new Date());
   await saveInvoice({
     chatId: session.chatId,
     supplier: session.supplier,
     paymentMethod: session.paymentMethod,
     vat: typeof session.vat === 'number' ? session.vat : null,
-    month: monthKeyOf(new Date()),
+    invoiceDate: session.invoiceDate || null,
+    month,
     createdAt: new Date().toISOString()
   });
 }
