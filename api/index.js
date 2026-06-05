@@ -277,10 +277,11 @@ function euro(n) {
   return n.toFixed(2).replace('.', ',') + ' €';
 }
 
-// Beleg-/Rechnungsnummer aus OCR-Text lesen. Gibt String oder null.
+// Beleg-/Rechnungs-/Bonnummer aus OCR-Text lesen. Gibt String oder null.
+// Erkennt viele Bezeichnungen und Nummern mit Buchstaben/Bindestrichen/Schrägstrichen.
 function detectReceiptNumber(text) {
   if (!text) return null;
-  const re = /\b(beleg|bon|rechnung|rg|quittung)s?[\s.\-]*(nr|nummer|no|number)?\.?\s*:?\s*#?\s*(\d{3,})/i;
+  const re = /\b(beleg|bon|rechnung|faktura|quittung|kassenbon|kassabon|rg)s?\s*[-.]?\s*(nr|nummer|no|number|n°)?\.?\s*[:#]?\s*([A-Z]{0,4}\d{3,}(?:[-\/.][A-Z0-9]+)*)/i;
   const m = text.match(re);
   return m ? m[3] : null;
 }
@@ -659,6 +660,9 @@ function askForPayment(ctx, userId) {
         [
           { text: 'Bar 💵', callback_data: 'payment_cash' },
           { text: 'Karte 💳', callback_data: 'payment_card' }
+        ],
+        [
+          { text: 'Überwiesen 🏦', callback_data: 'payment_transfer' }
         ]
       ]
     }
@@ -674,6 +678,19 @@ bot.action('payment_cash', async (ctx) => {
     return;
   }
   session.paymentMethod = 'Bar';
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
+});
+
+bot.action('payment_transfer', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Ueberwiesen';
   session.account = 'Geschaeftskonto';
   await processInvoice(ctx, userId, session);
 });
