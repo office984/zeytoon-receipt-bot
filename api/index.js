@@ -46,6 +46,15 @@ const SUPPLIERS = [
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userSessions = {};
 
+// Firebase Realtime Database (REST). Optionaler Auth-Token via FIREBASE_DB_SECRET.
+const FIREBASE_DB = (process.env.FIREBASE_DATABASE_URL || '').replace(/\/$/, '');
+const FIREBASE_AUTH = process.env.FIREBASE_DB_SECRET ? `?auth=${process.env.FIREBASE_DB_SECRET}` : '';
+
+const MONTHS_DE = [
+  'Januar', 'Februar', 'März', 'April', 'Mai', 'Juni',
+  'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'
+];
+
 console.log('🤖 Bot initialized');
 
 // ---------- Helpers ----------
@@ -191,6 +200,145 @@ function createPdfFromImage(imagePath, pdfPath) {
   });
 }
 
+// ---------- MwSt (VAT) Erkennung ----------
+
+// "1.234,56" / "12,50" / "12.50" -> Number
+function parseAmount(s) {
+  s = (s || '').trim();
+  if (s.includes(',')) {
+    return parseFloat(s.replace(/\./g, '').replace(/\s/g, '').replace(',', '.'));
+  }
+  return parseFloat(s.replace(/\s/g, ''));
+}
+
+// Geldbeträge im Text finden (europäisches Format bevorzugt)
+const MONEY_REGEX = /\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+,\d{2}|\d+\.\d{2}/g;
+
+// Best-effort: bezahlte MwSt aus OCR-Text lesen. Gibt Number oder null.
+function detectVat(text) {
+  if (!text) return null;
+  const lines = text.split(/\r?\n/);
+  const vatKey = /(mwst|mw\.?\s?st|u\.?\s?st\b|ust|mehrwertsteuer|m\.?w\.?s\.?t)/i;
+  const totalKey = /(gesamt|summe|total)/i;
+
+  const totals = [];
+  const rates = [];
+
+  for (const raw of lines) {
+    const line = raw.toLowerCase();
+    if (!vatKey.test(line)) continue;
+    const amounts = raw.match(MONEY_REGEX);
+    if (!amounts) continue;
+    const val = parseAmount(amounts[amounts.length - 1]);
+    if (isNaN(val)) continue;
+    if (totalKey.test(line)) totals.push(val);
+    else rates.push(val);
+  }
+
+  if (totals.length) return Math.max(...totals);
+  if (rates.length) return Math.round(rates.reduce((a, b) => a + b, 0) * 100) / 100;
+  return null;
+}
+
+function euro(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  return n.toFixed(2).replace('.', ',') + ' €';
+}
+
+// ---------- Zeit-Helfer ----------
+function monthKeyOf(date) {
+  return date.toISOString().slice(0, 7); // YYYY-MM
+}
+function monthLabel(key) {
+  const [y, m] = key.split('-');
+  return `${MONTHS_DE[parseInt(m, 10) - 1]} ${y}`;
+}
+function prevMonthKey(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() - 1, 1));
+  return d.toISOString().slice(0, 7);
+}
+
+// ---------- Firebase (REST) ----------
+async function saveInvoice(record) {
+  if (!FIREBASE_DB) return;
+  try {
+    await axios.post(`${FIREBASE_DB}/invoices.json${FIREBASE_AUTH}`, record);
+  } catch (error) {
+    console.error('Firebase save error:', error.response?.status, error.response?.data || error.message);
+  }
+}
+
+async function loadInvoices() {
+  if (!FIREBASE_DB) return {};
+  try {
+    const { data } = await axios.get(`${FIREBASE_DB}/invoices.json${FIREBASE_AUTH}`);
+    return data || {};
+  } catch (error) {
+    console.error('Firebase load error:', error.response?.status || error.message);
+    return {};
+  }
+}
+
+async function wasSummaryPosted(chatId, month) {
+  if (!FIREBASE_DB) return false;
+  try {
+    const { data } = await axios.get(`${FIREBASE_DB}/summariesPosted/${chatId}/${month}.json${FIREBASE_AUTH}`);
+    return data === true;
+  } catch {
+    return false;
+  }
+}
+
+async function markSummaryPosted(chatId, month) {
+  if (!FIREBASE_DB) return;
+  try {
+    await axios.put(`${FIREBASE_DB}/summariesPosted/${chatId}/${month}.json${FIREBASE_AUTH}`, true);
+  } catch (error) {
+    console.error('Firebase mark error:', error.message);
+  }
+}
+
+// ---------- Zusammenfassung ----------
+function summarize(invoicesObj, month, chatId) {
+  const recs = Object.values(invoicesObj || {}).filter(
+    (r) => r && r.month === month && (chatId == null || r.chatId === chatId)
+  );
+  const count = recs.length;
+  const withVat = recs.filter((r) => typeof r.vat === 'number');
+  const vatTotal = Math.round(withVat.reduce((s, r) => s + r.vat, 0) * 100) / 100;
+  return { count, vatTotal, missing: count - withVat.length };
+}
+
+function summaryText(label, s) {
+  let txt =
+    `📊 *Zusammenfassung ${label}*\n\n` +
+    `🧾 Belege: ${s.count}\n` +
+    `💶 Bezahlte MwSt gesamt: ${euro(s.vatTotal)}`;
+  if (s.missing > 0) {
+    txt += `\n\n⚠️ Bei ${s.missing} Beleg(en) konnte die MwSt nicht automatisch gelesen werden.`;
+  }
+  return txt;
+}
+
+async function postMonthlySummaries() {
+  const month = prevMonthKey(new Date());
+  const inv = await loadInvoices();
+  const recs = Object.values(inv || {}).filter((r) => r && r.month === month);
+  const chatIds = [...new Set(recs.map((r) => r.chatId))];
+
+  for (const chatId of chatIds) {
+    if (await wasSummaryPosted(chatId, month)) continue;
+    const s = summarize(inv, month, chatId);
+    try {
+      await bot.telegram.sendMessage(chatId, summaryText(monthLabel(month), s), { parse_mode: 'Markdown' });
+      await markSummaryPosted(chatId, month);
+      console.log(`📊 Monatsbericht ${month} an Chat ${chatId} gesendet`);
+    } catch (error) {
+      console.error('Monthly post error:', error.message);
+    }
+  }
+}
+
 // ---------- Commands ----------
 
 bot.start((ctx) => {
@@ -198,8 +346,22 @@ bot.start((ctx) => {
 });
 
 bot.help((ctx) => {
-  ctx.reply('📸 Foto oder PDF hochladen. Ich erkenne den Lieferanten selbst und frage nur noch nach der Zahlungsart.');
+  ctx.reply(
+    '📸 Foto oder PDF hochladen. Ich erkenne den Lieferanten selbst und frage nur noch nach der Zahlungsart.\n\n' +
+    '📊 /zusammenfassung – MwSt-Summe des laufenden Monats'
+  );
 });
+
+// Zusammenfassung des laufenden Monats für diesen Chat
+async function sendCurrentSummary(ctx) {
+  const month = monthKeyOf(new Date());
+  const inv = await loadInvoices();
+  const s = summarize(inv, month, ctx.chat.id);
+  await ctx.reply(summaryText(`${monthLabel(month)} (laufend)`, s), { parse_mode: 'Markdown' });
+}
+
+bot.command('zusammenfassung', sendCurrentSummary);
+bot.command('summary', sendCurrentSummary);
 
 // ---------- Eingang: Foto ----------
 bot.on('photo', async (ctx) => {
@@ -253,6 +415,7 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
 
   // OCR ausführen (Fehler -> trotzdem manuell weiter)
   let text = '';
+  let ocrError = null;
   try {
     const base64 = buffer.toString('base64');
     if (meta.isImage) {
@@ -261,10 +424,20 @@ async function handleIncomingFile(ctx, userId, fileId, meta) {
       text = await ocrPdf(base64);
     }
   } catch (error) {
-    console.error('OCR error:', error.response?.data || error.message);
+    ocrError = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    console.error('OCR error:', ocrError);
+  }
+
+  console.log(`OCR fertig – ${text.length} Zeichen erkannt`);
+
+  // Debug: Rohtext anzeigen, wenn DEBUG_OCR=true (wird NICHT auto-gelöscht)
+  if (process.env.DEBUG_OCR === 'true') {
+    const info = text && text.trim() ? text.slice(0, 3500) : `(KEIN Text)${ocrError ? '\nFehler: ' + ocrError : ''}`;
+    await ctx.reply(`🔧 DEBUG OCR:\n\n${info}`);
   }
 
   session.extractedText = text;
+  session.vat = detectVat(text);
   const supplier = matchSupplier(text);
 
   if (supplier) {
@@ -333,12 +506,8 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const session = userSessions[userId];
 
-  if (!session) {
-    ctx.reply('📸 Bitte lade erst ein Foto oder PDF hoch!');
-    return;
-  }
-
-  if (session.waitingForSupplier) {
+  // Wartet der Bot auf einen getippten Lieferanten-Namen? -> übernehmen
+  if (session && session.waitingForSupplier) {
     session.supplier = ctx.message.text;
     session.waitingForSupplier = false;
     // die getippte Antwort des Users auch wieder aufräumen
@@ -347,7 +516,15 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  ctx.reply('❌ Bitte nutze die Buttons!');
+  // In Gruppen NICHT auf beliebigen Text reagieren (z.B. ✅✅✅ als "erledigt"-Markierung).
+  // Nur im privaten Chat einen Hinweis geben.
+  if (ctx.chat.type !== 'private') return;
+
+  if (!session) {
+    ctx.reply('📸 Bitte lade erst ein Foto oder PDF hoch!');
+  } else {
+    ctx.reply('❌ Bitte nutze die Buttons!');
+  }
 });
 
 // ---------- Zahlungsart ----------
@@ -457,6 +634,7 @@ async function processInvoice(ctx, userId, session) {
         { caption: buildCaption(fileName, session) }
       );
       fs.unlinkSync(otherPath);
+      await persistInvoice(session);
       await cleanupMessages(ctx, session);
       delete userSessions[userId];
       return;
@@ -471,6 +649,9 @@ async function processInvoice(ctx, userId, session) {
 
     fs.unlinkSync(pdfPath);
 
+    // In Datenbank speichern (für Monats-Zusammenfassung)
+    await persistInvoice(session);
+
     // Alle Zwischen-Nachrichten + Original-Upload löschen -> nur PDF bleibt
     await cleanupMessages(ctx, session);
 
@@ -483,12 +664,26 @@ async function processInvoice(ctx, userId, session) {
 }
 
 function buildCaption(fileName, session) {
-  return (
+  let caption =
     `✅ Rechnung verarbeitet!\n\n` +
     `📄 ${fileName}\n` +
     `🏪 ${session.supplier}\n` +
-    `💰 ${session.paymentMethod}`
-  );
+    `💰 ${session.paymentMethod}`;
+  if (typeof session.vat === 'number') {
+    caption += `\n💶 MwSt (erkannt): ${euro(session.vat)}`;
+  }
+  return caption;
+}
+
+async function persistInvoice(session) {
+  await saveInvoice({
+    chatId: session.chatId,
+    supplier: session.supplier,
+    paymentMethod: session.paymentMethod,
+    vat: typeof session.vat === 'number' ? session.vat : null,
+    month: monthKeyOf(new Date()),
+    createdAt: new Date().toISOString()
+  });
 }
 
 // ---------- Server / Webhook ----------
@@ -503,7 +698,21 @@ app.post('/api/webhook', express.json(), async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt' });
+});
+
+// Manueller/externer Trigger für den Monatsbericht (z.B. Railway Cron am 1.)
+app.get('/api/cron/monthly', async (req, res) => {
+  if (process.env.CRON_KEY && req.query.key !== process.env.CRON_KEY) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    await postMonthlySummaries();
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Cron error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/', (req, res) => {
@@ -521,6 +730,17 @@ app.listen(PORT, async () => {
   } catch (error) {
     console.log(`⚠️ Webhook: ${error.message}`);
   }
+
+  // Monatsbericht: täglich prüfen, am 1. den Vormonat automatisch posten
+  const checkMonthly = async () => {
+    try {
+      if (new Date().getUTCDate() === 1) await postMonthlySummaries();
+    } catch (error) {
+      console.error('Scheduler error:', error.message);
+    }
+  };
+  checkMonthly();
+  setInterval(checkMonthly, 6 * 60 * 60 * 1000);
 });
 
 process.on('SIGINT', () => {
