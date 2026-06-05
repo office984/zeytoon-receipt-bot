@@ -2,32 +2,24 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { Telegraf } from 'telegraf';
-import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, push, set } from 'firebase/database';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const tempDir = path.join(__dirname, 'temp');
+
+// Create temp directory if it doesn't exist
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Firebase Config
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  projectId: "zeytoon-belege",
-  databaseURL: "https://zeytoon-belege-default-rtdb.europe-west1.firebasedatabase.app",
-  authDomain: "zeytoon-belege.firebaseapp.com",
-  storageBucket: "zeytoon-belege.appspot.com",
-};
-
-let database;
-try {
-  const firebaseApp = initializeApp(firebaseConfig);
-  database = getDatabase(firebaseApp);
-  console.log('✅ Firebase connected');
-} catch (error) {
-  console.error('Firebase error:', error.message);
-}
 
 // Telegram Bot
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -46,29 +38,27 @@ function generateFileName(data) {
 
 // Commands
 bot.start((ctx) => {
-  ctx.reply('👋 Willkommen!\n\n📸 Lade eine Rechnung hoch und ich verarbeite sie!');
+  ctx.reply('👋 Willkommen!\n\n📸 Lade ein Rechnungs-Foto hoch und ich benenne es für dich!');
 });
 
 bot.help((ctx) => {
-  ctx.reply('📸 Einfach ein Foto einer Rechnung hochladen!');
+  ctx.reply('📸 Einfach ein Foto hochladen!');
 });
 
 // Photo Handler
 bot.on('photo', async (ctx) => {
   const userId = ctx.from.id;
-  const chatId = ctx.chat.id;
   
   try {
     const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
     
-    // Initialize session
     userSessions[userId] = {
       fileId,
-      chatId,
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
       timestamp: new Date().toISOString()
     };
 
-    // Ask for supplier
     ctx.reply(
       '🏪 Von welchem Lieferant stammt die Rechnung?\n\nSchreib den Namen:',
       {
@@ -83,18 +73,17 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Text Handler - für Lieferant, Zahlungsart, Konto
+// Text Handler
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const text = ctx.message.text;
   const session = userSessions[userId];
 
   if (!session) {
-    ctx.reply('📸 Bitte lade erst ein Foto einer Rechnung hoch!');
+    ctx.reply('📸 Bitte lade erst ein Foto hoch!');
     return;
   }
 
-  // Step 1: Supplier Name
   if (!session.supplier) {
     session.supplier = text;
     ctx.reply(
@@ -113,7 +102,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  ctx.reply('❌ Bitte nutze die Buttons für deine Antwort!');
+  ctx.reply('❌ Bitte nutze die Buttons!');
 });
 
 // Payment callbacks
@@ -170,7 +159,7 @@ bot.action('account_business', async (ctx) => {
   }
 
   session.account = 'Geschaeftskonto';
-  await saveInvoice(ctx, userId, session);
+  await processInvoice(ctx, userId, session);
 });
 
 bot.action('account_private', async (ctx) => {
@@ -183,11 +172,11 @@ bot.action('account_private', async (ctx) => {
   }
 
   session.account = 'Privat';
-  await saveInvoice(ctx, userId, session);
+  await processInvoice(ctx, userId, session);
 });
 
-// Save to Firebase
-async function saveInvoice(ctx, userId, session) {
+// Process and rename photo
+async function processInvoice(ctx, userId, session) {
   try {
     const fileName = generateFileName({
       supplier: session.supplier,
@@ -195,36 +184,39 @@ async function saveInvoice(ctx, userId, session) {
       account: session.account
     });
 
-    const invoiceData = {
-      fileName,
-      supplier: session.supplier,
-      paymentMethod: session.paymentMethod,
-      account: session.account,
-      fileId: session.fileId,
-      timestamp: session.timestamp,
-      userId,
-      createdAt: new Date().toISOString()
-    };
-
-    // Save to Firebase
-    if (database) {
-      const invoicesRef = ref(database, 'invoices');
-      const newInvoiceRef = push(invoicesRef);
-      await newInvoiceRef.set(invoiceData);
-    }
-
-    ctx.reply(
-      `✅ Rechnung gespeichert!\n\n` +
-      `📄 Datei: ${fileName}\n` +
-      `🏪 Lieferant: ${session.supplier}\n` +
-      `💰 Zahlungsart: ${session.paymentMethod}\n` +
-      `🏦 Konto: ${session.account}`
+    // Get file from Telegram
+    const file = await ctx.telegram.getFile(session.fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    // Download file
+    const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    const fileExtension = file.file_path.split('.').pop();
+    const localPath = path.join(tempDir, `${fileName}.${fileExtension}`);
+    
+    // Save file locally
+    fs.writeFileSync(localPath, response.data);
+    
+    // Send file back to group with new name
+    const fileStream = fs.createReadStream(localPath);
+    await ctx.telegram.sendDocument(
+      session.chatId,
+      {
+        source: fileStream,
+        filename: `${fileName}.${fileExtension}`
+      },
+      {
+        caption: `✅ Rechnung verarbeitet!\n\n📄 ${fileName}\n🏪 ${session.supplier}\n💰 ${session.paymentMethod}\n🏦 ${session.account}`
+      }
     );
 
+    // Clean up temp file
+    fs.unlinkSync(localPath);
+
+    ctx.answerCbQuery('✅ Fertig!');
     delete userSessions[userId];
   } catch (error) {
-    console.error('Firebase error:', error);
-    ctx.reply('❌ Fehler beim Speichern. Bitte versuchen Sie es später erneut.');
+    console.error('Process error:', error);
+    ctx.reply('❌ Fehler beim Verarbeiten');
     delete userSessions[userId];
   }
 }
@@ -245,7 +237,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Root
 app.get('/', (req, res) => {
   res.json({ message: 'Zeytoon Receipt Bot is running' });
 });
