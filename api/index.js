@@ -180,12 +180,17 @@ async function cropToReceipt(buffer, bbox) {
     const H = meta.height;
     if (!W || !H) return buffer;
 
-    const padX = Math.round((bbox.maxX - bbox.minX) * 0.05);
-    const padY = Math.round((bbox.maxY - bbox.minY) * 0.05);
+    const boxW = bbox.maxX - bbox.minX;
+    const boxH = bbox.maxY - bbox.minY;
+    const padX = Math.round(boxW * 0.05);
+    // Oben etwas mehr Rand (Logo/Kopf), unten deutlich mehr:
+    // QR-Code + Infos sind KEIN Text und liegen daher unterhalb der Text-Box.
+    const padTop = Math.round(boxH * 0.08);
+    const padBottom = Math.round(boxH * 0.40);
     const left = Math.max(0, bbox.minX - padX);
-    const top = Math.max(0, bbox.minY - padY);
+    const top = Math.max(0, bbox.minY - padTop);
     const right = Math.min(W, bbox.maxX + padX);
-    const bottom = Math.min(H, bbox.maxY + padY);
+    const bottom = Math.min(H, bbox.maxY + padBottom);
     const width = right - left;
     const height = bottom - top;
 
