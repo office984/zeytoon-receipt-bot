@@ -982,7 +982,7 @@ async function handleIncomingFile(ctx, userId, items, meta) {
       ctx,
       session,
       `⚠️ *Achtung – Beleg evtl. doppelt!*\n` +
-        `Beleg-Nr. ${session.receiptNumber} wurde bereits erfasst` +
+        `Beleg-Nr. ${mdEscape(session.receiptNumber)} wurde bereits erfasst` +
         `${dup.invoiceDate ? ` (Datum ${dup.invoiceDate})` : ''}.\n\nTrotzdem verarbeiten?`,
       {
         parse_mode: 'Markdown',
@@ -1021,8 +1021,8 @@ function proceedAfterOcr(ctx, userId) {
     session.supplierGuessed = guessed; // frei gelesen -> bei Bestätigung dauerhaft lernen
     // Erkennung kann falsch sein -> bestätigen lassen oder ändern
     const hint = guessed
-      ? `🔎 Lieferant vom Beleg gelesen: *${supplier}*`
-      : `✅ Lieferant erkannt: *${supplier}*`;
+      ? `🔎 Lieferant vom Beleg gelesen: *${mdEscape(supplier)}*`
+      : `✅ Lieferant erkannt: *${mdEscape(supplier)}*`;
     trackReply(ctx, session, `${hint}\n\nStimmt das?`, {
       parse_mode: 'Markdown',
       reply_markup: {
@@ -1359,6 +1359,26 @@ function fmtDate(iso) {
   return `${d}.${m}.${y}`;
 }
 
+// Sonderzeichen für Telegram-Markdown entschärfen (ein einzelnes _ oder *
+// in z.B. einem Lieferantennamen würde die Nachricht sonst unsendbar machen).
+function mdEscape(v) {
+  return String(v == null ? '' : v).replace(/([_*`\[])/g, '\\$1');
+}
+
+// Zahlungsart hübsch + ohne Unterstrich anzeigen
+function prettyPayment(p) {
+  const map = {
+    Bar: 'Bar',
+    Ueberwiesen_BAWAG: 'Überwiesen (BAWAG)',
+    Ueberwiesen_N26: 'Überwiesen (N26)',
+    Ueberwiesen_Viva: 'Überwiesen (Viva)',
+    Karte_BAWAG: 'Karte (BAWAG)',
+    Karte_N26: 'Karte (N26)',
+    Karte_Viva: 'Karte (Viva)'
+  };
+  return p ? map[p] || p.replace(/_/g, ' ') : '—';
+}
+
 // Nach der Lieferanten-Auswahl: in der Erst-Erfassung -> Zahlungsart,
 // beim Korrigieren (Zahlungsart steht schon) -> zurück zur Übersicht.
 function afterSupplierChosen(ctx, userId) {
@@ -1374,12 +1394,12 @@ function showReview(ctx, userId) {
   if (!s) return;
   const txt =
     `📋 *Bitte prüfen:*\n\n` +
-    `🏪 Lieferant: ${s.supplier || '—'}\n` +
+    `🏪 Lieferant: ${mdEscape(s.supplier || '—')}\n` +
     `💶 Brutto: ${fmtAmount(s.total)}\n` +
     `🧾 MwSt: ${fmtAmount(s.vat)}\n` +
     `📅 Datum: ${fmtDate(s.invoiceDate)}\n` +
-    `🔖 Beleg-Nr.: ${s.receiptNumber || '—'}\n` +
-    `💳 Zahlung: ${s.paymentMethod || '—'}\n\n` +
+    `🔖 Beleg-Nr.: ${mdEscape(s.receiptNumber || '—')}\n` +
+    `💳 Zahlung: ${mdEscape(prettyPayment(s.paymentMethod))}\n\n` +
     `Stimmt alles? Sonst einzeln korrigieren:`;
   trackReply(ctx, s, txt, {
     parse_mode: 'Markdown',
@@ -1461,12 +1481,12 @@ bot.action('confirm_save', async (ctx) => {
 function lastInvoiceText(r) {
   return (
     `🗂️ *Letzter Beleg*\n\n` +
-    `🏪 ${r.supplier || '—'}\n` +
+    `🏪 ${mdEscape(r.supplier || '—')}\n` +
     `💶 Brutto: ${fmtAmount(r.total)}\n` +
     `🧾 MwSt: ${fmtAmount(r.vat)}\n` +
     `📅 ${fmtDate(r.invoiceDate)}\n` +
-    `🔖 ${r.receiptNumber || '—'}\n` +
-    `💳 ${r.paymentMethod || '—'}`
+    `🔖 ${mdEscape(r.receiptNumber || '—')}\n` +
+    `💳 ${mdEscape(prettyPayment(r.paymentMethod))}`
   );
 }
 
@@ -1601,7 +1621,7 @@ function buildCaption(fileName, session) {
     `✅ Rechnung verarbeitet!\n\n` +
     `📄 ${fileName}\n` +
     `🏪 ${session.supplier}\n` +
-    `💰 ${session.paymentMethod}`;
+    `💰 ${prettyPayment(session.paymentMethod)}`;
   const pages = session.images ? session.images.length : 0;
   if (pages > 1) {
     caption += `\n📑 Seiten: ${pages}`;
