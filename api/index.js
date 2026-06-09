@@ -406,6 +406,45 @@ function detectVat(text) {
   return null;
 }
 
+// Brutto-/Gesamtbetrag aus OCR-Text lesen. Gibt Number oder null.
+// Sucht nach Endbetrags-Stichwörtern (nach Priorität), sonst den größten Betrag.
+function detectTotal(text) {
+  if (!text) return null;
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+
+  // Auf einer Treffer-Zeile ist der Brutto-/Endbetrag der GRÖSSTE Betrag
+  // (z.B. Tabellenzeile "Summe 24,00 20,00 4,00" -> 24,00, nicht die MwSt 4,00).
+  const amountOf = (line) => {
+    const a = (line.match(MONEY_REGEX) || []).map(parseAmount).filter((v) => !isNaN(v));
+    return a.length ? Math.max(...a) : NaN;
+  };
+
+  const keyTiers = [
+    /(zu\s*zahlen|zahlbetrag|zahlungsbetrag)/i,
+    /(gesamtbetrag|rechnungsbetrag|gesamt|total)/i,
+    /(brutto|summe|betrag)/i
+  ];
+  for (const key of keyTiers) {
+    let best = null;
+    for (const line of lines) {
+      if (!key.test(line)) continue;
+      const v = amountOf(line);
+      if (!isNaN(v)) best = best === null ? v : Math.max(best, v);
+    }
+    if (best !== null) return best;
+  }
+
+  // Fallback: größter Geldbetrag im ganzen Text (meist der Brutto-Gesamtbetrag)
+  let max = null;
+  for (const line of lines) {
+    for (const t of line.match(MONEY_REGEX) || []) {
+      const v = parseAmount(t);
+      if (!isNaN(v) && (max === null || v > max)) max = v;
+    }
+  }
+  return max;
+}
+
 function euro(n) {
   if (n === null || n === undefined || isNaN(n)) return '—';
   return n.toFixed(2).replace('.', ',') + ' €';
@@ -512,11 +551,32 @@ function prevMonthKey(date) {
 
 // ---------- Firebase (REST) ----------
 async function saveInvoice(record) {
-  if (!FIREBASE_DB) return;
+  if (!FIREBASE_DB) return null;
   try {
-    await axios.post(`${FIREBASE_DB}/invoices.json${FIREBASE_AUTH}`, record);
+    const { data } = await axios.post(`${FIREBASE_DB}/invoices.json${FIREBASE_AUTH}`, record);
+    return data?.name || null; // von Firebase vergebener Push-Key
   } catch (error) {
     console.error('Firebase save error:', error.response?.status, error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Einzelnen Beleg aktualisieren (Korrektur) bzw. löschen
+async function updateInvoice(key, patch) {
+  if (!FIREBASE_DB || !key) return;
+  try {
+    await axios.patch(`${FIREBASE_DB}/invoices/${key}.json${FIREBASE_AUTH}`, patch);
+  } catch (error) {
+    console.error('Firebase update error:', error.message);
+  }
+}
+
+async function deleteInvoiceByKey(key) {
+  if (!FIREBASE_DB || !key) return;
+  try {
+    await axios.delete(`${FIREBASE_DB}/invoices/${key}.json${FIREBASE_AUTH}`);
+  } catch (error) {
+    console.error('Firebase delete error:', error.message);
   }
 }
 
@@ -614,17 +674,29 @@ function summarize(invoicesObj, month, chatId) {
   );
   const count = recs.length;
   const withVat = recs.filter((r) => typeof r.vat === 'number');
+  const withTotal = recs.filter((r) => typeof r.total === 'number');
   const vatTotal = Math.round(withVat.reduce((s, r) => s + r.vat, 0) * 100) / 100;
-  return { count, vatTotal, missing: count - withVat.length };
+  const grandTotal = Math.round(withTotal.reduce((s, r) => s + r.total, 0) * 100) / 100;
+  return {
+    count,
+    vatTotal,
+    grandTotal,
+    missingVat: count - withVat.length,
+    missingTotal: count - withTotal.length
+  };
 }
 
 function summaryText(label, s) {
   let txt =
     `📊 *Zusammenfassung ${label}*\n\n` +
     `🧾 Belege: ${s.count}\n` +
-    `💶 Bezahlte MwSt gesamt: ${euro(s.vatTotal)}`;
-  if (s.missing > 0) {
-    txt += `\n\n⚠️ Bei ${s.missing} Beleg(en) konnte die MwSt nicht automatisch gelesen werden.`;
+    `💰 Ausgaben gesamt (Brutto): ${euro(s.grandTotal)}\n` +
+    `💶 davon MwSt: ${euro(s.vatTotal)}`;
+  const notes = [];
+  if (s.missingTotal > 0) notes.push(`${s.missingTotal}× ohne Betrag`);
+  if (s.missingVat > 0) notes.push(`${s.missingVat}× ohne MwSt`);
+  if (notes.length) {
+    txt += `\n\n⚠️ Nicht automatisch gelesen: ${notes.join(', ')}.`;
   }
   return txt;
 }
@@ -656,8 +728,10 @@ bot.start((ctx) => {
 
 bot.help((ctx) => {
   ctx.reply(
-    '📸 Foto oder PDF hochladen. Ich erkenne den Lieferanten selbst und frage nur noch nach der Zahlungsart.\n\n' +
-    '📊 /zusammenfassung – MwSt-Summe des laufenden Monats'
+    '📸 Foto oder PDF hochladen. Ich lese Lieferant, Betrag, MwSt, Datum und Beleg-Nr. aus – ' +
+    'du prüfst die Werte und kannst alles korrigieren, bevor gespeichert wird.\n\n' +
+    '📊 /zusammenfassung – Ausgaben & MwSt des laufenden Monats\n' +
+    '🗂️ /letzter – letzten Beleg ansehen, korrigieren oder löschen'
   );
 });
 
@@ -792,6 +866,7 @@ async function handleIncomingFile(ctx, userId, items, meta) {
 
   session.extractedText = text;
   session.vat = detectVat(text);
+  session.total = detectTotal(text);
   session.invoiceDate = detectDate(text);
   session.receiptNumber = detectReceiptNumber(text);
 
@@ -874,7 +949,7 @@ bot.action('supplier_confirm', async (ctx) => {
     learnSupplier(session.supplier);
     session.supplierGuessed = false;
   }
-  askForPayment(ctx, userId);
+  afterSupplierChosen(ctx, userId);
 });
 
 // Erkannten Lieferanten korrigieren -> Liste zur Auswahl zeigen
@@ -959,13 +1034,35 @@ bot.action(/^supplier_(\d+)$/, async (ctx) => {
   }
 
   session.supplier = supplier.name;
-  askForPayment(ctx, userId);
+  afterSupplierChosen(ctx, userId);
 });
 
 // Text-Handler (für "Sonstiges")
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const session = userSessions[userId];
+
+  // Wartet der Bot auf einen Wert (Betrag/Datum/Nr.) aus der Prüfen-Übersicht?
+  if (session && session.waitingForField) {
+    const field = session.waitingForField;
+    const raw = (ctx.message.text || '').trim();
+    session.waitingForField = null;
+    session.userMessageIds = session.userMessageIds || [];
+    session.userMessageIds.push(ctx.message.message_id);
+
+    if (field === 'total' || field === 'vat') {
+      const v = parseAmount(raw.replace(/[€\s]/g, ''));
+      if (!isNaN(v)) session[field] = v;
+    } else if (field === 'date') {
+      const iso = detectDate(raw); // versteht TT.MM.JJJJ / TT.MM.JJ
+      if (iso) session.invoiceDate = iso;
+    } else if (field === 'receiptNumber') {
+      session.receiptNumber = raw || null;
+    }
+
+    showReview(ctx, userId);
+    return;
+  }
 
   // Wartet der Bot auf einen getippten Lieferanten-Namen? -> übernehmen
   if (session && session.waitingForSupplier) {
@@ -977,7 +1074,7 @@ bot.on('text', async (ctx) => {
     learnSupplier(typed);
     // die getippte Antwort des Users auch wieder aufräumen
     session.botMessages.push(ctx.message.message_id);
-    askForPayment(ctx, userId);
+    afterSupplierChosen(ctx, userId);
     return;
   }
 
@@ -1020,7 +1117,7 @@ bot.action('payment_cash', async (ctx) => {
   }
   session.paymentMethod = 'Bar';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('payment_transfer', async (ctx) => {
@@ -1056,7 +1153,7 @@ bot.action('transfer_bawag', async (ctx) => {
   }
   session.paymentMethod = 'Ueberwiesen_BAWAG';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('transfer_n26', async (ctx) => {
@@ -1069,7 +1166,7 @@ bot.action('transfer_n26', async (ctx) => {
   }
   session.paymentMethod = 'Ueberwiesen_N26';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('transfer_viva', async (ctx) => {
@@ -1082,7 +1179,7 @@ bot.action('transfer_viva', async (ctx) => {
   }
   session.paymentMethod = 'Ueberwiesen_Viva';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('payment_card', async (ctx) => {
@@ -1118,7 +1215,7 @@ bot.action('card_bawag', async (ctx) => {
   }
   session.paymentMethod = 'Karte_BAWAG';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('card_n26', async (ctx) => {
@@ -1131,7 +1228,7 @@ bot.action('card_n26', async (ctx) => {
   }
   session.paymentMethod = 'Karte_N26';
   session.account = 'Geschaeftskonto';
-  await processInvoice(ctx, userId, session);
+  await showReview(ctx, userId);
 });
 
 bot.action('card_viva', async (ctx) => {
@@ -1144,7 +1241,179 @@ bot.action('card_viva', async (ctx) => {
   }
   session.paymentMethod = 'Karte_Viva';
   session.account = 'Geschaeftskonto';
+  await showReview(ctx, userId);
+});
+
+// ---------- Werte prüfen / korrigieren ----------
+function fmtAmount(n) {
+  return typeof n === 'number' ? euro(n) : '—';
+}
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const [y, m, d] = iso.split('-');
+  return `${d}.${m}.${y}`;
+}
+
+// Nach der Lieferanten-Auswahl: in der Erst-Erfassung -> Zahlungsart,
+// beim Korrigieren (Zahlungsart steht schon) -> zurück zur Übersicht.
+function afterSupplierChosen(ctx, userId) {
+  const session = userSessions[userId];
+  if (!session) return;
+  if (session.paymentMethod) showReview(ctx, userId);
+  else askForPayment(ctx, userId);
+}
+
+// Übersicht aller erkannten Werte mit Korrektur-Buttons
+function showReview(ctx, userId) {
+  const s = userSessions[userId];
+  if (!s) return;
+  const txt =
+    `📋 *Bitte prüfen:*\n\n` +
+    `🏪 Lieferant: ${s.supplier || '—'}\n` +
+    `💶 Brutto: ${fmtAmount(s.total)}\n` +
+    `🧾 MwSt: ${fmtAmount(s.vat)}\n` +
+    `📅 Datum: ${fmtDate(s.invoiceDate)}\n` +
+    `🔖 Beleg-Nr.: ${s.receiptNumber || '—'}\n` +
+    `💳 Zahlung: ${s.paymentMethod || '—'}\n\n` +
+    `Stimmt alles? Sonst einzeln korrigieren:`;
+  trackReply(ctx, s, txt, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'Lieferant ✏️', callback_data: 'edit_supplier' },
+          { text: 'Brutto ✏️', callback_data: 'edit_total' }
+        ],
+        [
+          { text: 'MwSt ✏️', callback_data: 'edit_vat' },
+          { text: 'Datum ✏️', callback_data: 'edit_date' }
+        ],
+        [
+          { text: 'Beleg-Nr. ✏️', callback_data: 'edit_receipt' }
+        ],
+        [
+          { text: 'Speichern ✅', callback_data: 'confirm_save' }
+        ]
+      ]
+    }
+  });
+}
+
+// Lieferant ändern -> bekannte Liste / freie Eingabe (kehrt danach zur Übersicht zurück)
+bot.action('edit_supplier', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  if (!userSessions[userId]) return ctx.reply('❌ Sitzung abgelaufen');
+  askForSupplier(ctx, userId);
+});
+
+// Betrags-/Datums-/Nummern-Felder: nach Eingabe fragen
+const FIELD_PROMPTS = {
+  total: '💶 Brutto-Betrag eingeben (z.B. 24,90):',
+  vat: '🧾 MwSt-Betrag eingeben (z.B. 2,26):',
+  date: '📅 Datum eingeben (TT.MM.JJJJ):',
+  receiptNumber: '🔖 Beleg-Nr. eingeben:'
+};
+function askForField(ctx, userId, field) {
+  const session = userSessions[userId];
+  if (!session) return;
+  session.waitingForField = field;
+  trackReply(ctx, session, FIELD_PROMPTS[field]);
+}
+bot.action('edit_total', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'total'); });
+bot.action('edit_vat', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'vat'); });
+bot.action('edit_date', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'date'); });
+bot.action('edit_receipt', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'receiptNumber'); });
+
+// Speichern bestätigen -> neuer Beleg ODER Korrektur eines gespeicherten
+bot.action('confirm_save', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) return ctx.reply('❌ Sitzung abgelaufen');
+
+  if (session.correctingKey) {
+    const patch = {
+      supplier: session.supplier,
+      paymentMethod: session.paymentMethod,
+      total: typeof session.total === 'number' ? session.total : null,
+      vat: typeof session.vat === 'number' ? session.vat : null,
+      invoiceDate: session.invoiceDate || null,
+      receiptNumber: session.receiptNumber || null
+    };
+    if (session.invoiceDate) patch.month = session.invoiceDate.slice(0, 7);
+    await updateInvoice(session.correctingKey, patch);
+    await trackReply(ctx, session, '✅ Beleg aktualisiert.');
+    await cleanupMessages(ctx, session);
+    delete userSessions[userId];
+    return;
+  }
+
   await processInvoice(ctx, userId, session);
+});
+
+// ---------- Letzten Beleg ansehen / korrigieren / löschen ----------
+function lastInvoiceText(r) {
+  return (
+    `🗂️ *Letzter Beleg*\n\n` +
+    `🏪 ${r.supplier || '—'}\n` +
+    `💶 Brutto: ${fmtAmount(r.total)}\n` +
+    `🧾 MwSt: ${fmtAmount(r.vat)}\n` +
+    `📅 ${fmtDate(r.invoiceDate)}\n` +
+    `🔖 ${r.receiptNumber || '—'}\n` +
+    `💳 ${r.paymentMethod || '—'}`
+  );
+}
+
+async function findLastInvoice(chatId) {
+  const inv = await loadInvoices();
+  const entries = Object.entries(inv || {}).filter(([, r]) => r && r.chatId === chatId);
+  if (!entries.length) return null;
+  entries.sort((a, b) => new Date(b[1].createdAt || 0) - new Date(a[1].createdAt || 0));
+  return { key: entries[0][0], rec: entries[0][1] };
+}
+
+bot.command('letzter', async (ctx) => {
+  const last = await findLastInvoice(ctx.chat.id);
+  if (!last) return ctx.reply('Noch kein Beleg gespeichert.');
+  await ctx.reply(lastInvoiceText(last.rec), {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Korrigieren ✏️', callback_data: `fix_${last.key}` },
+        { text: 'Löschen 🗑️', callback_data: `del_${last.key}` }
+      ]]
+    }
+  });
+});
+
+bot.action(/^del_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await deleteInvoiceByKey(ctx.match[1]);
+  await ctx.editMessageText('🗑️ Beleg gelöscht.').catch(() => ctx.reply('🗑️ Beleg gelöscht.'));
+});
+
+// Gespeicherten Beleg zur Korrektur in eine Session laden -> Übersicht (ohne neues PDF)
+bot.action(/^fix_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const key = ctx.match[1];
+  const inv = await loadInvoices();
+  const r = inv && inv[key];
+  if (!r) return ctx.reply('❌ Beleg nicht mehr gefunden.');
+  userSessions[userId] = {
+    chatId: ctx.chat.id,
+    botMessages: [],
+    userMessageIds: [],
+    supplier: r.supplier,
+    total: typeof r.total === 'number' ? r.total : null,
+    vat: typeof r.vat === 'number' ? r.vat : null,
+    invoiceDate: r.invoiceDate || null,
+    receiptNumber: r.receiptNumber || null,
+    paymentMethod: r.paymentMethod || null,
+    correctingKey: key
+  };
+  showReview(ctx, userId);
 });
 
 // ---------- Rechnung fertigstellen ----------
@@ -1232,8 +1501,11 @@ function buildCaption(fileName, session) {
   if (session.receiptNumber) {
     caption += `\n🧾 Beleg-Nr.: ${session.receiptNumber}`;
   }
+  if (typeof session.total === 'number') {
+    caption += `\n💶 Brutto: ${euro(session.total)}`;
+  }
   if (typeof session.vat === 'number') {
-    caption += `\n💶 MwSt (erkannt): ${euro(session.vat)}`;
+    caption += `\n   davon MwSt: ${euro(session.vat)}`;
   }
   return caption;
 }
@@ -1245,6 +1517,7 @@ async function persistInvoice(session) {
     chatId: session.chatId,
     supplier: session.supplier,
     paymentMethod: session.paymentMethod,
+    total: typeof session.total === 'number' ? session.total : null,
     vat: typeof session.vat === 'number' ? session.vat : null,
     invoiceDate: session.invoiceDate || null,
     receiptNumber: session.receiptNumber || null,
