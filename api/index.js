@@ -46,6 +46,32 @@ const SUPPLIERS = [
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userSessions = {};
 
+// Mehrere Fotos auf einmal (Telegram-Album) = EINE Rechnung mit mehreren Seiten.
+// Album-Fotos kommen als getrennte Updates mit gleicher media_group_id an.
+// Wir sammeln sie kurz und verarbeiten sie dann gemeinsam.
+const mediaGroups = {};
+const MEDIA_GROUP_DEBOUNCE_MS = 2500;
+
+function bufferMediaGroupItem(ctx, userId, mediaGroupId, item, meta) {
+  const key = `${userId}:${mediaGroupId}`;
+  let group = mediaGroups[key];
+  if (!group) {
+    group = { items: [], meta, timer: null };
+    mediaGroups[key] = group;
+  }
+  group.items.push(item);
+  if (group.timer) clearTimeout(group.timer);
+  group.timer = setTimeout(() => {
+    delete mediaGroups[key];
+    // In Telegram-Reihenfolge (nach Nachrichten-ID) sortieren = Seitenreihenfolge
+    group.items.sort((a, b) => a.messageId - b.messageId);
+    handleIncomingFile(ctx, userId, group.items, group.meta).catch((error) => {
+      console.error('Media group error:', error);
+      ctx.reply('❌ Fehler bei der Verarbeitung');
+    });
+  }, MEDIA_GROUP_DEBOUNCE_MS);
+}
+
 // Firebase Realtime Database (REST). Optionaler Auth-Token via FIREBASE_DB_SECRET.
 const FIREBASE_DB = (process.env.FIREBASE_DATABASE_URL || '').replace(/\/$/, '');
 const FIREBASE_AUTH = process.env.FIREBASE_DB_SECRET ? `?auth=${process.env.FIREBASE_DB_SECRET}` : '';
@@ -69,7 +95,7 @@ async function trackReply(ctx, session, text, extra) {
 // Alle Zwischen-Nachrichten + das hochgeladene Original löschen -> nur PDF bleibt
 async function cleanupMessages(ctx, session) {
   const ids = [...(session.botMessages || [])];
-  if (session.userMessageId) ids.push(session.userMessageId);
+  if (session.userMessageIds) ids.push(...session.userMessageIds);
   for (const id of ids) {
     await ctx.telegram.deleteMessage(session.chatId, id).catch(() => {});
   }
@@ -208,36 +234,41 @@ function generateFileName(data) {
   return `${date}_${supplier}_${payment}_${belegNr}`;
 }
 
-// PDF aus Bild erstellen
-function createPdfFromImage(imagePath, pdfPath) {
+// PDF aus einem oder mehreren Bildern erstellen (ein Bild = eine Seite)
+function createPdfFromImages(imagePaths, pdfPath) {
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ size: 'A4', margin: 10 });
       const stream = fs.createWriteStream(pdfPath);
       doc.pipe(stream);
 
-      const img = doc.openImage(imagePath);
-      const pageWidth = doc.page.width - 20;
-      const pageHeight = doc.page.height - 20;
+      imagePaths.forEach((imagePath, idx) => {
+        if (idx > 0) doc.addPage();
 
-      let width = img.width;
-      let height = img.height;
+        const img = doc.openImage(imagePath);
+        const pageWidth = doc.page.width - 20;
+        const pageHeight = doc.page.height - 20;
 
-      if (width > pageWidth) {
-        const ratio = pageWidth / width;
-        width = pageWidth;
-        height = height * ratio;
-      }
-      if (height > pageHeight) {
-        const ratio = pageHeight / height;
-        height = pageHeight;
-        width = width * ratio;
-      }
+        let width = img.width;
+        let height = img.height;
 
-      const x = (doc.page.width - width) / 2;
-      const y = (doc.page.height - height) / 2;
+        if (width > pageWidth) {
+          const ratio = pageWidth / width;
+          width = pageWidth;
+          height = height * ratio;
+        }
+        if (height > pageHeight) {
+          const ratio = pageHeight / height;
+          height = pageHeight;
+          width = width * ratio;
+        }
 
-      doc.image(imagePath, x, y, { width, height });
+        const x = (doc.page.width - width) / 2;
+        const y = (doc.page.height - height) / 2;
+
+        doc.image(imagePath, x, y, { width, height });
+      });
+
       doc.end();
 
       stream.on('finish', resolve);
@@ -483,7 +514,16 @@ bot.on('photo', async (ctx) => {
   const userId = ctx.from.id;
   try {
     const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-    await handleIncomingFile(ctx, userId, fileId, { type: 'photo', isImage: true });
+    const item = { fileId, messageId: ctx.message.message_id };
+    const meta = { type: 'photo', isImage: true };
+
+    // Album (mehrere Fotos auf einmal) -> sammeln und als EINE Rechnung verarbeiten
+    if (ctx.message.media_group_id) {
+      bufferMediaGroupItem(ctx, userId, ctx.message.media_group_id, item, meta);
+      return;
+    }
+
+    await handleIncomingFile(ctx, userId, [item], meta);
   } catch (error) {
     console.error('Photo error:', error);
     ctx.reply('❌ Fehler bei der Verarbeitung');
@@ -498,12 +538,17 @@ bot.on('document', async (ctx) => {
     const mime = doc.mime_type || '';
     const isImage = mime.startsWith('image/');
     const isPdf = mime === 'application/pdf' || (doc.file_name || '').toLowerCase().endsWith('.pdf');
-    await handleIncomingFile(ctx, userId, doc.file_id, {
-      type: 'document',
-      isImage,
-      isPdf,
-      fileName: doc.file_name
-    });
+    const item = { fileId: doc.file_id, messageId: ctx.message.message_id };
+    const meta = { type: 'document', isImage, isPdf, fileName: doc.file_name };
+
+    // Album aus Bild-Dateien (mehrere auf einmal) -> als EINE Rechnung verarbeiten.
+    // PDFs werden nicht zusammengefasst (jedes PDF ist für sich ein Beleg).
+    if (ctx.message.media_group_id && isImage && !isPdf) {
+      bufferMediaGroupItem(ctx, userId, ctx.message.media_group_id, item, meta);
+      return;
+    }
+
+    await handleIncomingFile(ctx, userId, [item], meta);
   } catch (error) {
     console.error('Document error:', error);
     ctx.reply('❌ Fehler bei der Verarbeitung');
@@ -511,41 +556,70 @@ bot.on('document', async (ctx) => {
 });
 
 // Gemeinsame Verarbeitung: Download -> OCR -> Lieferant erkennen
-async function handleIncomingFile(ctx, userId, fileId, meta) {
+// items: Array von { fileId, messageId } – bei einem Album mehrere Seiten einer Rechnung.
+async function handleIncomingFile(ctx, userId, items, meta) {
   userSessions[userId] = {
-    fileId,
+    fileId: items[0].fileId,
     chatId: ctx.chat.id,
-    userMessageId: ctx.message.message_id,
+    userMessageIds: items.map((it) => it.messageId),
     botMessages: [],
     timestamp: new Date().toISOString(),
+    images: [],
     ...meta
   };
   const session = userSessions[userId];
 
-  await trackReply(ctx, session, '🔍 Lese Rechnung...');
-
-  const { buffer, ext } = await downloadTelegramFile(ctx, fileId);
-  session.buffer = buffer;
-  session.ext = ext;
+  const pageCount = items.length;
+  await trackReply(
+    ctx,
+    session,
+    pageCount > 1 ? `🔍 Lese Rechnung (${pageCount} Seiten)...` : '🔍 Lese Rechnung...'
+  );
 
   // OCR ausführen (Fehler -> trotzdem manuell weiter)
   let text = '';
   let ocrError = null;
   try {
-    const base64 = buffer.toString('base64');
     if (meta.isImage) {
-      const r = await ocrImage(base64);
-      text = r.text;
-      session.cropBox = r.bbox;
-    } else if (meta.isPdf) {
-      text = await ocrPdf(base64);
+      // Jede Seite herunterladen + per OCR lesen; Texte aller Seiten zusammenführen
+      const texts = [];
+      for (const it of items) {
+        const { buffer, ext } = await downloadTelegramFile(ctx, it.fileId);
+        let pageText = '';
+        let pageBox = null;
+        try {
+          const r = await ocrImage(buffer.toString('base64'));
+          pageText = r.text;
+          pageBox = r.bbox;
+        } catch (error) {
+          ocrError = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+          console.error('OCR error:', ocrError);
+        }
+        session.images.push({ buffer, ext, cropBox: pageBox });
+        if (pageText) texts.push(pageText);
+      }
+      text = texts.join('\n');
+      // Rückwärtskompatibel: erste Seite auch als buffer/ext/cropBox bereitstellen
+      if (session.images[0]) {
+        session.buffer = session.images[0].buffer;
+        session.ext = session.images[0].ext;
+        session.cropBox = session.images[0].cropBox;
+      }
+    } else {
+      // PDF / sonstige Datei: nur die erste (einzige) Datei
+      const { buffer, ext } = await downloadTelegramFile(ctx, items[0].fileId);
+      session.buffer = buffer;
+      session.ext = ext;
+      if (meta.isPdf) {
+        text = await ocrPdf(buffer.toString('base64'));
+      }
     }
   } catch (error) {
     ocrError = error.response?.data ? JSON.stringify(error.response.data) : error.message;
     console.error('OCR error:', ocrError);
   }
 
-  console.log(`OCR fertig – ${text.length} Zeichen erkannt`);
+  console.log(`OCR fertig – ${text.length} Zeichen erkannt (${pageCount} Seite(n))`);
 
   // Debug: Rohtext anzeigen, wenn DEBUG_OCR=true (wird NICHT auto-gelöscht)
   if (process.env.DEBUG_OCR === 'true') {
@@ -744,6 +818,9 @@ bot.action('payment_transfer', async (ctx) => {
         [
           { text: 'BAWAG', callback_data: 'transfer_bawag' },
           { text: 'N26', callback_data: 'transfer_n26' }
+        ],
+        [
+          { text: 'Viva', callback_data: 'transfer_viva' }
         ]
       ]
     }
@@ -776,6 +853,19 @@ bot.action('transfer_n26', async (ctx) => {
   await processInvoice(ctx, userId, session);
 });
 
+bot.action('transfer_viva', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Ueberwiesen_Viva';
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
+});
+
 bot.action('payment_card', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from.id;
@@ -790,6 +880,9 @@ bot.action('payment_card', async (ctx) => {
         [
           { text: 'BAWAG', callback_data: 'card_bawag' },
           { text: 'N26', callback_data: 'card_n26' }
+        ],
+        [
+          { text: 'Viva', callback_data: 'card_viva' }
         ]
       ]
     }
@@ -822,6 +915,19 @@ bot.action('card_n26', async (ctx) => {
   await processInvoice(ctx, userId, session);
 });
 
+bot.action('card_viva', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Karte_Viva';
+  session.account = 'Geschaeftskonto';
+  await processInvoice(ctx, userId, session);
+});
+
 // ---------- Rechnung fertigstellen ----------
 async function processInvoice(ctx, userId, session) {
   try {
@@ -838,12 +944,20 @@ async function processInvoice(ctx, userId, session) {
     const pdfPath = path.join(tempDir, `${fileName}.pdf`);
 
     if (session.isImage) {
-      // Bild auf Rechnungs-Bereich zuschneiden, dann -> PDF
-      const cropped = await cropToReceipt(session.buffer, session.cropBox);
-      const originalPath = path.join(tempDir, `${fileName}.${session.ext}`);
-      fs.writeFileSync(originalPath, cropped);
-      await createPdfFromImage(originalPath, pdfPath);
-      fs.unlinkSync(originalPath);
+      // Jede Seite auf den Rechnungs-Bereich zuschneiden, dann -> mehrseitiges PDF
+      const images = session.images && session.images.length
+        ? session.images
+        : [{ buffer: session.buffer, ext: session.ext, cropBox: session.cropBox }];
+      const pagePaths = [];
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const cropped = await cropToReceipt(img.buffer, img.cropBox);
+        const pagePath = path.join(tempDir, `${fileName}_p${i + 1}.${img.ext}`);
+        fs.writeFileSync(pagePath, cropped);
+        pagePaths.push(pagePath);
+      }
+      await createPdfFromImages(pagePaths, pdfPath);
+      pagePaths.forEach((p) => fs.unlinkSync(p));
     } else if (session.isPdf) {
       // schon ein PDF -> nur umbenannt speichern
       fs.writeFileSync(pdfPath, session.buffer);
@@ -892,6 +1006,10 @@ function buildCaption(fileName, session) {
     `📄 ${fileName}\n` +
     `🏪 ${session.supplier}\n` +
     `💰 ${session.paymentMethod}`;
+  const pages = session.images ? session.images.length : 0;
+  if (pages > 1) {
+    caption += `\n📑 Seiten: ${pages}`;
+  }
   if (session.receiptNumber) {
     caption += `\n🧾 Beleg-Nr.: ${session.receiptNumber}`;
   }
@@ -930,8 +1048,8 @@ app.post('/api/webhook', express.json(), async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-06-05-crop-nr',
-    features: ['ocr', 'crop', 'receiptNr', 'ueberwiesen'],
+    version: '2026-06-09-multipage-viva',
+    features: ['ocr', 'crop', 'receiptNr', 'ueberwiesen', 'multipage', 'viva'],
     firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt'
   });
 });
