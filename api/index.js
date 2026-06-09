@@ -23,7 +23,8 @@ app.use(express.json({ limit: '50mb' }));
 
 // Lieferanten + Stichwörter zur automatischen Erkennung aus dem OCR-Text.
 // keywords sind kleingeschrieben; Treffer mit Wortgrenzen, längster Treffer gewinnt.
-const SUPPLIERS = [
+// `let`, weil die Liste zur Laufzeit um neu gelernte Lieferanten wächst (siehe learnSupplier).
+let SUPPLIERS = [
   { name: 'Metro 1110', keywords: ['metro'] },
   { name: 'GastroGenius GmbH', keywords: ['gastrogenius', 'gastro genius'] },
   { name: 'Sahan Einzelhandel GmbH', keywords: ['sahan'] },
@@ -40,7 +41,10 @@ const SUPPLIERS = [
   { name: 'Interspar', keywords: ['interspar'] },
   { name: 'Alizadeh Ashouri', keywords: ['alizadeh', 'ashouri'] },
   { name: 'Reza Davoudi', keywords: ['reza davoudi', 'davoudi'] },
-  { name: 'Etsan', keywords: ['etsan'] }
+  { name: 'Etsan', keywords: ['etsan'] },
+  { name: 'T-Mobile', keywords: ['t-mobile', 't mobile', 'tmobile', 'magenta telekom'] },
+  { name: 'SWV Wien', keywords: ['swv wien', 'swv'] },
+  { name: 'Mega Gastro GmbH', keywords: ['mega gastro', 'megagastro'] }
 ];
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -136,6 +140,54 @@ function matchSupplier(text) {
   }
 
   return best ? best.name : null;
+}
+
+// --- Freies Auslesen des Lieferanten aus dem Beleg-Kopf (wenn die Liste nicht trifft) ---
+// Rechtsformen = starkes Signal für den Firmennamen
+const LEGAL_FORM_RE = /\b(gmbh|gesmbh|ges\.?\s?m\.?\s?b\.?\s?h|e\.?\s?u\.?|kg|og|ohg|ag|e\.?\s?gen)\b/i;
+// Zeilen, die KEIN Firmenname sind (Belegkopf-Rauschen)
+const HEADER_NOISE_RE = /(rechnung|kassabon|kassenbon|beleg|quittung|datum|uhrzeit|uid|atu|steuer|tel\.?|telefon|fax|www\.|http|@|iban|bic|filiale|kunde|seite|betrag|summe|gesamt|mwst|ust)/i;
+const ADDRESS_RE = /(stra(ss|ß)e|str\.|gasse|platz|\b\d{4}\b)/i; // Straße / 4-stellige PLZ
+const DATE_LINE_RE = /\b\d{1,2}[.\/]\d{1,2}[.\/]\d{2,4}\b/;
+
+// Eine Kopf-Zeile in einen sauberen Lieferantennamen verwandeln
+function cleanSupplierName(line) {
+  return (line || '')
+    .replace(/[*_`]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[^\p{L}\d]+/u, '')      // führende Symbole weg
+    .replace(/[^\p{L}\d.)\s&+-]+$/u, '') // Müll am Ende weg
+    .trim();
+}
+
+// Lieferantennamen frei aus den ersten Belegzeilen raten. Gibt Namen oder null zurück.
+function guessSupplierFromText(text) {
+  if (!text) return null;
+  const header = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+
+  // 1) Zeile mit Rechtsform (GmbH, e.U., KG ...) = sehr wahrscheinlich der Name
+  for (const line of header) {
+    if (LEGAL_FORM_RE.test(line) && !HEADER_NOISE_RE.test(line)) {
+      const name = cleanSupplierName(line);
+      if (name.length >= 3 && name.length <= 50) return name;
+    }
+  }
+
+  // 2) Sonst: erste „firmen-artige" Zeile (genug Buchstaben, keine Adresse/Datum/Rauschen)
+  for (const line of header) {
+    if (HEADER_NOISE_RE.test(line) || ADDRESS_RE.test(line) || DATE_LINE_RE.test(line)) continue;
+    const letters = (line.match(/\p{L}/gu) || []).length;
+    const digits = (line.match(/\d/gu) || []).length;
+    if (letters < 3 || digits > letters) continue; // zu wenig Text / zu viele Zahlen
+    const name = cleanSupplierName(line);
+    if (name.length >= 3 && name.length <= 50) return name;
+  }
+
+  return null;
 }
 
 // OCR für Bilder über Google Vision REST API (mit API-Key)
@@ -360,12 +412,72 @@ function euro(n) {
 }
 
 // Beleg-/Rechnungs-/Bonnummer aus OCR-Text lesen. Gibt String oder null.
-// Erkennt viele Bezeichnungen und Nummern mit Buchstaben/Bindestrichen/Schrägstrichen.
+// Mehrstufig: zuerst spezifische Labels (Beleg/Bon/Rechnung/...), dann ein
+// eigenständiges "Nr./No.". Der Wert darf auf derselben ODER der nächsten Zeile
+// stehen. Datum/Uhrzeit/UID/Geldbeträge werden vorher entfernt, damit z.B. nicht
+// die Jahreszahl eines Datums fälschlich als Nummer übernommen wird.
 function detectReceiptNumber(text) {
   if (!text) return null;
-  const re = /\b(beleg|bon|rechnung|faktura|quittung|kassenbon|kassabon|rg)s?\s*[-.]?\s*(nr|nummer|no|number|n°)?\.?\s*[:#]?\s*([A-Z]{0,4}\d{3,}(?:[-\/.][A-Z0-9]+)*)/i;
-  const m = text.match(re);
-  return m ? m[3] : null;
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+
+  // Datum / Uhrzeit / UID / Beträge aus einem Zeilenrest entfernen
+  const stripNoise = (s) =>
+    (s || '')
+      .replace(/\b\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}\b/g, ' ') // Datum
+      .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')          // Uhrzeit
+      .replace(/\batu\s?\d+/gi, ' ')                          // UID
+      .replace(/\b\d{1,3}(?:\.\d{3})+,\d{2}\b/g, ' ')         // 1.234,00
+      .replace(/\b\d+,\d{2}\b/g, ' ');                        // 12,40
+
+  // Eine Nummer (opt. Buchstaben-Präfix, >=3 Ziffern, mit Trennern) herausziehen
+  const grab = (s) => {
+    const clean = stripNoise(s);
+    const re = /([A-Z]{0,5}[-\/.]?\d{3,}(?:[-\/.][A-Z0-9]+)*)/gi;
+    let m;
+    while ((m = re.exec(clean)) !== null) {
+      const v = m[1].replace(/^[-\/.]+|[-\/.]+$/g, '');
+      if (v && /\d/.test(v)) return v;
+    }
+    return null;
+  };
+
+  // Wert nach dem Label – sonst in den nächsten 1-2 Zeilen (Label/Wert in 2 Spalten)
+  const valueFrom = (rest, i) => {
+    let v = grab(rest);
+    if (v) return v;
+    for (let k = i + 1; k < Math.min(i + 3, lines.length); k++) {
+      if (lines[k]) { v = grab(lines[k]); if (v) return v; }
+    }
+    return null;
+  };
+
+  // Spezifische Labels nach Priorität (Position im Text egal, erster Treffer gewinnt).
+  // Der Lookahead verhindert Teilwort-Treffer (z.B. "Bonus", "Restaurant").
+  const tiers = [
+    /\b(?:beleg|bon|kassenbon|kassabon|belegid)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i,
+    /\b(?:rechnung|faktura|invoice|rg|re)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i,
+    /\b(?:quittung|auftrag|transaktion|vorgang|receipt|ta)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i
+  ];
+  for (const re of tiers) {
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(re);
+      if (!m) continue;
+      const v = valueFrom(m[1], i);
+      if (v) return v;
+    }
+  }
+
+  // Eigenständiges "Nr./No." – aber NICHT auf Telefon-/UID-/Steuer-/Kunden-Zeilen
+  const genericSkip = /(tel|telefon|fax|iban|bic|uid|atu|steuer|st\.?\s?nr|ust|kunden|kassen[\s-]*id|terminal|\btid\b|\bmid\b)/i;
+  const genericNr = /\b(?:nr|no|n°|nummer|number)\b\.?\s*[:#]?\s*(.*)/i;
+  for (let i = 0; i < lines.length; i++) {
+    if (genericSkip.test(lines[i])) continue;
+    const m = lines[i].match(genericNr);
+    if (!m) continue;
+    const v = valueFrom(m[1], i);
+    if (v) return v;
+  }
+  return null;
 }
 
 // Rechnungsdatum aus OCR-Text lesen (TT.MM.JJJJ / TT/MM/JJJJ / TT.MM.JJ). Gibt 'YYYY-MM-DD' oder null.
@@ -447,6 +559,52 @@ async function markSummaryPosted(chatId, month) {
   } catch (error) {
     console.error('Firebase mark error:', error.message);
   }
+}
+
+// ---------- Gelernte Lieferanten (wachsende Liste in Firebase) ----------
+async function loadLearnedSuppliers() {
+  if (!FIREBASE_DB) return [];
+  try {
+    const { data } = await axios.get(`${FIREBASE_DB}/suppliers.json${FIREBASE_AUTH}`);
+    // Firebase liefert {pushId: {...}} -> in Array wandeln
+    return data ? Object.values(data).filter((s) => s && s.name) : [];
+  } catch (error) {
+    console.error('Firebase suppliers load error:', error.response?.status || error.message);
+    return [];
+  }
+}
+
+async function persistLearnedSupplier(entry) {
+  if (!FIREBASE_DB) return;
+  try {
+    await axios.post(`${FIREBASE_DB}/suppliers.json${FIREBASE_AUTH}`, entry);
+  } catch (error) {
+    console.error('Firebase supplier save error:', error.message);
+  }
+}
+
+// Neuen Lieferanten in die laufende Liste übernehmen + dauerhaft speichern.
+// Dedupliziert über den normalisierten Namen / vorhandene Stichwörter.
+// Gibt true zurück, wenn wirklich neu gelernt wurde.
+function learnSupplier(rawName) {
+  const name = (rawName || '').trim();
+  const norm = normalize(name);
+  if (!norm) return false;
+  const exists = SUPPLIERS.some(
+    (s) => normalize(s.name) === norm || s.keywords.some((k) => normalize(k) === norm)
+  );
+  if (exists) return false;
+
+  // Stichwörter ableiten: voller Name + (falls markant) erstes Wort
+  const keywords = [norm];
+  const firstWord = norm.split(' ').find((w) => w.length >= 5 && !/^\d+$/.test(w));
+  if (firstWord && firstWord !== norm) keywords.push(firstWord);
+
+  const entry = { name, keywords };
+  SUPPLIERS.push(entry);          // sofort in dieser Session nutzbar
+  persistLearnedSupplier(entry);  // im Hintergrund dauerhaft speichern
+  console.log(`📇 Neuer Lieferant gelernt: ${name}`);
+  return true;
 }
 
 // ---------- Zusammenfassung ----------
@@ -668,11 +826,24 @@ async function handleIncomingFile(ctx, userId, items, meta) {
 function proceedAfterOcr(ctx, userId) {
   const session = userSessions[userId];
   if (!session) return;
-  const supplier = matchSupplier(session.extractedText);
+
+  // 1) Bekannte Stichwort-Liste (sicherste Erkennung)
+  let supplier = matchSupplier(session.extractedText);
+  let guessed = false;
+  // 2) Sonst: Lieferant frei aus dem Beleg-Kopf lesen
+  if (!supplier) {
+    supplier = guessSupplierFromText(session.extractedText);
+    guessed = !!supplier;
+  }
+
   if (supplier) {
     session.supplier = supplier;
+    session.supplierGuessed = guessed; // frei gelesen -> bei Bestätigung dauerhaft lernen
     // Erkennung kann falsch sein -> bestätigen lassen oder ändern
-    trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*\n\nStimmt das?`, {
+    const hint = guessed
+      ? `🔎 Lieferant vom Beleg gelesen: *${supplier}*`
+      : `✅ Lieferant erkannt: *${supplier}*`;
+    trackReply(ctx, session, `${hint}\n\nStimmt das?`, {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
@@ -697,6 +868,11 @@ bot.action('supplier_confirm', async (ctx) => {
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
+  }
+  // Frei gelesener Lieferant + vom User bestätigt -> dauerhaft in die Liste lernen
+  if (session.supplierGuessed && session.supplier) {
+    learnSupplier(session.supplier);
+    session.supplierGuessed = false;
   }
   askForPayment(ctx, userId);
 });
@@ -793,8 +969,12 @@ bot.on('text', async (ctx) => {
 
   // Wartet der Bot auf einen getippten Lieferanten-Namen? -> übernehmen
   if (session && session.waitingForSupplier) {
-    session.supplier = ctx.message.text;
+    const typed = (ctx.message.text || '').trim();
+    session.supplier = typed;
+    session.supplierGuessed = false;
     session.waitingForSupplier = false;
+    // Getippter (neuer) Lieferant -> dauerhaft in die Liste lernen
+    learnSupplier(typed);
     // die getippte Antwort des Users auch wieder aufräumen
     session.botMessages.push(ctx.message.message_id);
     askForPayment(ctx, userId);
@@ -1138,6 +1318,25 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
+
+  // Früher gelernte Lieferanten aus Firebase an die Liste anhängen
+  try {
+    const learned = await loadLearnedSuppliers();
+    let added = 0;
+    for (const s of learned) {
+      const norm = normalize(s.name);
+      if (!norm || SUPPLIERS.some((x) => normalize(x.name) === norm)) continue;
+      SUPPLIERS.push({
+        name: s.name,
+        keywords: Array.isArray(s.keywords) && s.keywords.length ? s.keywords : [norm]
+      });
+      added++;
+    }
+    console.log(`📇 Lieferanten aktiv: ${SUPPLIERS.length} (davon ${added} gelernt)`);
+  } catch (error) {
+    console.error('Lieferanten-Load:', error.message);
+  }
+
   try {
     const webhookUrl = process.env.WEBHOOK_URL;
     if (webhookUrl && /^https:\/\/.+/.test(webhookUrl)) {
