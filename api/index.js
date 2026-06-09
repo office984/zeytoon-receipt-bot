@@ -50,6 +50,16 @@ let SUPPLIERS = [
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userSessions = {};
 
+// Sessions liegen im RAM, werden aber nach jedem Update nach Firebase gespiegelt
+// und beim Start wieder eingelesen -> sie überleben Neustarts/Redeploys.
+// EIN zentraler Punkt: nach jedem verarbeiteten Update die Session sichern
+// (sofern der Handler sie nicht beendet hat).
+bot.use(async (ctx, next) => {
+  await next();
+  const uid = ctx.from?.id;
+  if (uid != null && userSessions[uid]) persistSession(uid);
+});
+
 // Mehrere Fotos auf einmal (Telegram-Album) = EINE Rechnung mit mehreren Seiten.
 // Album-Fotos kommen als getrennte Updates mit gleicher media_group_id an.
 // Wir sammeln sie kurz und verarbeiten sie dann gemeinsam.
@@ -580,6 +590,99 @@ async function deleteInvoiceByKey(key) {
   }
 }
 
+// ---------- Sessions persistent halten (überleben Neustart/Redeploy) ----------
+// Bilddaten (Buffer) werden NICHT gespeichert – sie sind groß und lassen sich
+// per Telegram-file_id jederzeit neu laden. Gespeichert wird nur der Zustand.
+function serializeSession(s) {
+  const out = {};
+  for (const [k, v] of Object.entries(s)) {
+    if (k === 'buffer' || v === undefined) continue;
+    if (k === 'images') {
+      out.images = (v || []).map((im) => ({ ext: im.ext || null, cropBox: im.cropBox || null }));
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function deserializeSession(d) {
+  const s = { ...d, buffer: null };
+  if (Array.isArray(s.images)) s.images = s.images.map((im) => ({ ...im, buffer: null }));
+  return s;
+}
+
+async function saveSession(userId) {
+  const s = userSessions[userId];
+  if (!s || !FIREBASE_DB) return;
+  try {
+    await axios.put(`${FIREBASE_DB}/sessions/${userId}.json${FIREBASE_AUTH}`, serializeSession(s));
+  } catch (error) {
+    console.error('Session save error:', error.message);
+  }
+}
+// Feuer-und-vergiss (blockiert den Handler nicht)
+function persistSession(userId) {
+  saveSession(userId).catch(() => {});
+}
+
+async function dropSession(userId) {
+  delete userSessions[userId];
+  if (!FIREBASE_DB) return;
+  try {
+    await axios.delete(`${FIREBASE_DB}/sessions/${userId}.json${FIREBASE_AUTH}`);
+  } catch (error) {
+    console.error('Session drop error:', error.message);
+  }
+}
+
+// Beim Start: offene Sessions zurückholen (nur die letzten 24h, ältere verwerfen)
+async function loadSessionsAtStartup() {
+  if (!FIREBASE_DB) return 0;
+  try {
+    const { data } = await axios.get(`${FIREBASE_DB}/sessions.json${FIREBASE_AUTH}`);
+    if (!data) return 0;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let n = 0;
+    for (const [uid, d] of Object.entries(data)) {
+      const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
+      if (ts && ts < cutoff) {
+        axios.delete(`${FIREBASE_DB}/sessions/${uid}.json${FIREBASE_AUTH}`).catch(() => {});
+        continue;
+      }
+      userSessions[uid] = deserializeSession(d);
+      n++;
+    }
+    return n;
+  } catch (error) {
+    console.error('Session load error:', error.message);
+    return 0;
+  }
+}
+
+// Bild-/PDF-Daten sicherstellen – nach einem Neustart fehlen die Buffer und
+// werden hier per Telegram-file_id frisch heruntergeladen.
+async function ensureBuffers(ctx, session) {
+  try {
+    if (session.isImage && session.images && session.images.length) {
+      for (let i = 0; i < session.images.length; i++) {
+        if (!session.images[i].buffer && session.fileIds && session.fileIds[i]) {
+          const { buffer, ext } = await downloadTelegramFile(ctx, session.fileIds[i]);
+          session.images[i].buffer = buffer;
+          session.images[i].ext = session.images[i].ext || ext;
+        }
+      }
+    }
+    if (!session.buffer && session.fileId) {
+      const { buffer, ext } = await downloadTelegramFile(ctx, session.fileId);
+      session.buffer = buffer;
+      session.ext = session.ext || ext;
+    }
+  } catch (error) {
+    console.error('Re-Download fehlgeschlagen:', error.message);
+  }
+}
+
 async function loadInvoices() {
   if (!FIREBASE_DB) return {};
   try {
@@ -797,6 +900,7 @@ bot.on('document', async (ctx) => {
 async function handleIncomingFile(ctx, userId, items, meta) {
   userSessions[userId] = {
     fileId: items[0].fileId,
+    fileIds: items.map((it) => it.fileId), // alle Seiten -> Neu-Download nach Neustart
     chatId: ctx.chat.id,
     userMessageIds: items.map((it) => it.messageId),
     botMessages: [],
@@ -869,6 +973,7 @@ async function handleIncomingFile(ctx, userId, items, meta) {
   session.total = detectTotal(text);
   session.invoiceDate = detectDate(text);
   session.receiptNumber = detectReceiptNumber(text);
+  persistSession(userId); // Session sofort sichern (auch im Media-Group-Timer-Pfad)
 
   // Doppelten Beleg erkennen (anhand Beleg-Nr. im selben Chat)
   const dup = await findDuplicate(session.chatId, session.receiptNumber);
@@ -983,7 +1088,7 @@ bot.action('dup_cancel', async (ctx) => {
   if (!session) return;
   await trackReply(ctx, session, '❌ Abgebrochen – Beleg wurde nicht erneut verarbeitet.');
   await cleanupMessages(ctx, session);
-  delete userSessions[userId];
+  await dropSession(userId);
 });
 
 // ---------- Lieferant manuell (Fallback) ----------
@@ -1345,7 +1450,7 @@ bot.action('confirm_save', async (ctx) => {
     await updateInvoice(session.correctingKey, patch);
     await trackReply(ctx, session, '✅ Beleg aktualisiert.');
     await cleanupMessages(ctx, session);
-    delete userSessions[userId];
+    await dropSession(userId);
     return;
   }
 
@@ -1422,6 +1527,9 @@ async function processInvoice(ctx, userId, session) {
     const processingMsg = await ctx.reply('⏳ Verarbeite Rechnung...');
     session.botMessages.push(processingMsg.message_id);
 
+    // Nach einem Neustart fehlen die Bild-/PDF-Daten -> per file_id neu laden
+    await ensureBuffers(ctx, session);
+
     const fileName = generateFileName({
       supplier: session.supplier,
       paymentMethod: session.paymentMethod,
@@ -1461,7 +1569,7 @@ async function processInvoice(ctx, userId, session) {
       fs.unlinkSync(otherPath);
       await persistInvoice(session);
       await cleanupMessages(ctx, session);
-      delete userSessions[userId];
+      await dropSession(userId);
       return;
     }
 
@@ -1480,11 +1588,11 @@ async function processInvoice(ctx, userId, session) {
     // Alle Zwischen-Nachrichten + Original-Upload löschen -> nur PDF bleibt
     await cleanupMessages(ctx, session);
 
-    delete userSessions[userId];
+    await dropSession(userId);
   } catch (error) {
     console.error('Process error:', error);
     ctx.reply('❌ Fehler beim Verarbeiten');
-    delete userSessions[userId];
+    await dropSession(userId);
   }
 }
 
@@ -1610,6 +1718,14 @@ app.listen(PORT, async () => {
     console.error('Lieferanten-Load:', error.message);
   }
 
+  // Offene Sessions nach einem Neustart zurückholen
+  try {
+    const restored = await loadSessionsAtStartup();
+    if (restored) console.log(`♻️ ${restored} offene Session(s) wiederhergestellt`);
+  } catch (error) {
+    console.error('Session-Load:', error.message);
+  }
+
   try {
     const webhookUrl = process.env.WEBHOOK_URL;
     if (webhookUrl && /^https:\/\/.+/.test(webhookUrl)) {
@@ -1638,4 +1754,13 @@ app.listen(PORT, async () => {
 process.on('SIGINT', () => {
   console.log('Shutting down...');
   process.exit(0);
+});
+
+// Den Prozess NICHT an einem einzelnen Fehler sterben lassen (sonst gehen
+// laufende Sitzungen im RAM verloren). Nur protokollieren.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
 });
