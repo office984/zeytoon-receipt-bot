@@ -671,13 +671,47 @@ function proceedAfterOcr(ctx, userId) {
   const supplier = matchSupplier(session.extractedText);
   if (supplier) {
     session.supplier = supplier;
-    trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*`, { parse_mode: 'Markdown' });
-    askForPayment(ctx, userId);
+    // Erkennung kann falsch sein -> bestätigen lassen oder ändern
+    trackReply(ctx, session, `✅ Lieferant erkannt: *${supplier}*\n\nStimmt das?`, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Passt ✅', callback_data: 'supplier_confirm' },
+            { text: 'Ändern ✏️', callback_data: 'supplier_change' }
+          ]
+        ]
+      }
+    });
   } else {
     trackReply(ctx, session, '🤔 Lieferant konnte nicht automatisch erkannt werden.');
     askForSupplier(ctx, userId);
   }
 }
+
+// Erkannten Lieferanten bestätigen -> weiter zur Zahlungsart
+bot.action('supplier_confirm', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  askForPayment(ctx, userId);
+});
+
+// Erkannten Lieferanten korrigieren -> Liste zur Auswahl zeigen
+bot.action('supplier_change', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const userId = ctx.from.id;
+  const session = userSessions[userId];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  askForSupplier(ctx, userId);
+});
 
 // Duplikat-Entscheidung
 bot.action('dup_continue', async (ctx) => {
