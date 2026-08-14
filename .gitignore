@@ -6,6 +6,10 @@
 
 # Node
 node_modules/
+# Absichtlich NICHT eingecheckt: die Lockfile wird je nach Betriebssystem erzeugt
+# und enthaelt bei "sharp" plattform-spezifische Binaries. Eine unter Windows
+# erzeugte Lockfile laesst den Build auf Railway (Linux) fehlschlagen.
+package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

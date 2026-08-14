@@ -7,6 +7,18 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
+import {
+  normalize,
+  parseAmount,
+  euro,
+  detectTotalInfo,
+  detectVatInfo,
+  detectReceiptNumber,
+  detectDate,
+  guessSupplierFromText,
+  matchSupplier,
+  vatLooksOff
+} from './detect.js';
 
 dotenv.config();
 
@@ -50,14 +62,23 @@ let SUPPLIERS = [
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userSessions = {};
 
+// Session-Schlüssel = Chat + Benutzer. Wichtig, weil derselbe Benutzer den Bot
+// gleichzeitig in einer Gruppe UND im Privatchat verwenden kann – sonst
+// überschreiben sich die beiden Vorgänge gegenseitig.
+function sidOf(ctx) {
+  const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id ?? 'nochat';
+  return `${chatId}_${ctx.from?.id}`;
+}
+
 // Sessions liegen im RAM, werden aber nach jedem Update nach Firebase gespiegelt
 // und beim Start wieder eingelesen -> sie überleben Neustarts/Redeploys.
 // EIN zentraler Punkt: nach jedem verarbeiteten Update die Session sichern
 // (sofern der Handler sie nicht beendet hat).
 bot.use(async (ctx, next) => {
   await next();
-  const uid = ctx.from?.id;
-  if (uid != null && userSessions[uid]) persistSession(uid);
+  if (!ctx.from) return;
+  const sid = sidOf(ctx);
+  if (userSessions[sid]) persistSession(sid);
 });
 
 // Mehrere Fotos auf einmal (Telegram-Album) = EINE Rechnung mit mehreren Seiten.
@@ -66,8 +87,8 @@ bot.use(async (ctx, next) => {
 const mediaGroups = {};
 const MEDIA_GROUP_DEBOUNCE_MS = 2500;
 
-function bufferMediaGroupItem(ctx, userId, mediaGroupId, item, meta) {
-  const key = `${userId}:${mediaGroupId}`;
+function bufferMediaGroupItem(ctx, sid, mediaGroupId, item, meta) {
+  const key = `${sid}:${mediaGroupId}`;
   let group = mediaGroups[key];
   if (!group) {
     group = { items: [], meta, timer: null };
@@ -79,7 +100,7 @@ function bufferMediaGroupItem(ctx, userId, mediaGroupId, item, meta) {
     delete mediaGroups[key];
     // In Telegram-Reihenfolge (nach Nachrichten-ID) sortieren = Seitenreihenfolge
     group.items.sort((a, b) => a.messageId - b.messageId);
-    handleIncomingFile(ctx, userId, group.items, group.meta).catch((error) => {
+    handleIncomingFile(ctx, sid, group.items, group.meta).catch((error) => {
       console.error('Media group error:', error);
       ctx.reply('❌ Fehler bei der Verarbeitung');
     });
@@ -115,90 +136,8 @@ async function cleanupMessages(ctx, session) {
   }
 }
 
-// Text normalisieren: klein, ohne Akzente, einfache Leerzeichen
-function normalize(str) {
-  return (str || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Lieferant aus OCR-Text erkennen. Gibt den Namen zurück oder null.
-function matchSupplier(text) {
-  const norm = normalize(text);
-  if (!norm) return null;
-
-  let best = null;
-  let bestLen = 0;
-
-  for (const supplier of SUPPLIERS) {
-    for (const kw of supplier.keywords) {
-      const nk = normalize(kw);
-      if (!nk) continue;
-      const re = new RegExp(`\\b${escapeRegex(nk)}`, 'i');
-      if (re.test(norm) && nk.length > bestLen) {
-        best = supplier;
-        bestLen = nk.length;
-      }
-    }
-  }
-
-  return best ? best.name : null;
-}
-
-// --- Freies Auslesen des Lieferanten aus dem Beleg-Kopf (wenn die Liste nicht trifft) ---
-// Rechtsformen = starkes Signal für den Firmennamen
-const LEGAL_FORM_RE = /\b(gmbh|gesmbh|ges\.?\s?m\.?\s?b\.?\s?h|e\.?\s?u\.?|kg|og|ohg|ag|e\.?\s?gen)\b/i;
-// Zeilen, die KEIN Firmenname sind (Belegkopf-Rauschen)
-const HEADER_NOISE_RE = /(rechnung|kassabon|kassenbon|beleg|quittung|datum|uhrzeit|uid|atu|steuer|tel\.?|telefon|fax|www\.|http|@|iban|bic|filiale|kunde|seite|betrag|summe|gesamt|mwst|ust)/i;
-const ADDRESS_RE = /(stra(ss|ß)e|str\.|gasse|platz|\b\d{4}\b)/i; // Straße / 4-stellige PLZ
-const DATE_LINE_RE = /\b\d{1,2}[.\/]\d{1,2}[.\/]\d{2,4}\b/;
-
-// Eine Kopf-Zeile in einen sauberen Lieferantennamen verwandeln
-function cleanSupplierName(line) {
-  return (line || '')
-    .replace(/[*_`]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/^[^\p{L}\d]+/u, '')      // führende Symbole weg
-    .replace(/[^\p{L}\d.)\s&+-]+$/u, '') // Müll am Ende weg
-    .trim();
-}
-
-// Lieferantennamen frei aus den ersten Belegzeilen raten. Gibt Namen oder null zurück.
-function guessSupplierFromText(text) {
-  if (!text) return null;
-  const header = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .slice(0, 12);
-
-  // 1) Zeile mit Rechtsform (GmbH, e.U., KG ...) = sehr wahrscheinlich der Name
-  for (const line of header) {
-    if (LEGAL_FORM_RE.test(line) && !HEADER_NOISE_RE.test(line)) {
-      const name = cleanSupplierName(line);
-      if (name.length >= 3 && name.length <= 50) return name;
-    }
-  }
-
-  // 2) Sonst: erste „firmen-artige" Zeile (genug Buchstaben, keine Adresse/Datum/Rauschen)
-  for (const line of header) {
-    if (HEADER_NOISE_RE.test(line) || ADDRESS_RE.test(line) || DATE_LINE_RE.test(line)) continue;
-    const letters = (line.match(/\p{L}/gu) || []).length;
-    const digits = (line.match(/\d/gu) || []).length;
-    if (letters < 3 || digits > letters) continue; // zu wenig Text / zu viele Zahlen
-    const name = cleanSupplierName(line);
-    if (name.length >= 3 && name.length <= 50) return name;
-  }
-
-  return null;
-}
+// Erkennungs-Logik (normalize, matchSupplier, guessSupplierFromText, Beträge,
+// MwSt, Belegnummer, Datum) liegt in ./detect.js – dort auch mit Tests abgedeckt.
 
 // OCR für Bilder über Google Vision REST API (mit API-Key)
 async function ocrImage(base64) {
@@ -346,206 +285,6 @@ function createPdfFromImages(imagePaths, pdfPath) {
   });
 }
 
-// ---------- MwSt (VAT) Erkennung ----------
-
-// "1.234,56" / "12,50" / "12.50" -> Number
-function parseAmount(s) {
-  s = (s || '').trim();
-  if (s.includes(',')) {
-    return parseFloat(s.replace(/\./g, '').replace(/\s/g, '').replace(',', '.'));
-  }
-  return parseFloat(s.replace(/\s/g, ''));
-}
-
-// Geldbeträge im Text finden (europäisches Format bevorzugt)
-const MONEY_REGEX = /\d{1,3}(?:[.\s]\d{3})*,\d{2}|\d+,\d{2}|\d+\.\d{2}/g;
-
-// Zeile besteht im Wesentlichen nur aus einem Geldbetrag (z.B. "125.12", "1.376,35", "€ 12,50")
-function isMoneyLine(line) {
-  return /^\s*€?\s*\d[\d.\s]*[.,]\d{2}\s*$/.test(line);
-}
-
-// Best-effort: bezahlte MwSt aus OCR-Text lesen. Gibt Number oder null.
-function detectVat(text) {
-  if (!text) return null;
-  const lines = text.split(/\r?\n/).map((l) => l.trim());
-
-  // 1) Tabellen-Format (AT-Kassenbons): Kopfzeile "Brutto Netto MwSt",
-  //    danach Summen-Zeile mit drei Werten -> MwSt ist der kleinste.
-  const headerIdx = lines.findIndex(
-    (l) => /brutto/i.test(l) && /netto/i.test(l) && /mwst/i.test(l)
-  );
-  if (headerIdx >= 0) {
-    let sumIdx = -1;
-    for (let i = headerIdx + 1; i < lines.length; i++) {
-      if (/\bsumme\b/i.test(lines[i])) { sumIdx = i; break; }
-    }
-    const start = sumIdx >= 0 ? sumIdx + 1 : headerIdx + 1;
-    const amounts = [];
-    for (let i = start; i < lines.length; i++) {
-      const l = lines[i];
-      if (isMoneyLine(l)) {
-        const v = parseAmount(l.replace(/[€\s]/g, ''));
-        if (!isNaN(v)) amounts.push(v);
-      } else if (amounts.length) {
-        break; // Zahlenblock zu Ende
-      } else if (/%/.test(l) || l === '' || /^\d+$/.test(l)) {
-        continue; // Rate / Leerzeile / einzelne Ziffer überspringen
-      }
-    }
-    if (amounts.length) return Math.min(...amounts);
-  }
-
-  // 2) Fallback: Zeile mit MwSt-Stichwort + Betrag auf derselben Zeile
-  const vatKey = /(mwst|mw\.?\s?st|u\.?\s?st\b|ust|mehrwertsteuer|m\.?w\.?s\.?t)/i;
-  const totalKey = /(gesamt|summe|total)/i;
-  const totals = [];
-  const rates = [];
-  for (const raw of lines) {
-    const line = raw.toLowerCase();
-    if (!vatKey.test(line)) continue;
-    const amounts = raw.match(MONEY_REGEX);
-    if (!amounts) continue;
-    const val = parseAmount(amounts[amounts.length - 1]);
-    if (isNaN(val)) continue;
-    if (totalKey.test(line)) totals.push(val);
-    else rates.push(val);
-  }
-  if (totals.length) return Math.max(...totals);
-  if (rates.length) return Math.round(rates.reduce((a, b) => a + b, 0) * 100) / 100;
-  return null;
-}
-
-// Brutto-/Gesamtbetrag aus OCR-Text lesen. Gibt Number oder null.
-// Sucht nach Endbetrags-Stichwörtern (nach Priorität), sonst den größten Betrag.
-function detectTotal(text) {
-  if (!text) return null;
-  const lines = text.split(/\r?\n/).map((l) => l.trim());
-
-  // Auf einer Treffer-Zeile ist der Brutto-/Endbetrag der GRÖSSTE Betrag
-  // (z.B. Tabellenzeile "Summe 24,00 20,00 4,00" -> 24,00, nicht die MwSt 4,00).
-  const amountOf = (line) => {
-    const a = (line.match(MONEY_REGEX) || []).map(parseAmount).filter((v) => !isNaN(v));
-    return a.length ? Math.max(...a) : NaN;
-  };
-
-  const keyTiers = [
-    /(zu\s*zahlen|zahlbetrag|zahlungsbetrag)/i,
-    /(gesamtbetrag|rechnungsbetrag|gesamt|total)/i,
-    /(brutto|summe|betrag)/i
-  ];
-  for (const key of keyTiers) {
-    let best = null;
-    for (const line of lines) {
-      if (!key.test(line)) continue;
-      const v = amountOf(line);
-      if (!isNaN(v)) best = best === null ? v : Math.max(best, v);
-    }
-    if (best !== null) return best;
-  }
-
-  // Fallback: größter Geldbetrag im ganzen Text (meist der Brutto-Gesamtbetrag)
-  let max = null;
-  for (const line of lines) {
-    for (const t of line.match(MONEY_REGEX) || []) {
-      const v = parseAmount(t);
-      if (!isNaN(v) && (max === null || v > max)) max = v;
-    }
-  }
-  return max;
-}
-
-function euro(n) {
-  if (n === null || n === undefined || isNaN(n)) return '—';
-  return n.toFixed(2).replace('.', ',') + ' €';
-}
-
-// Beleg-/Rechnungs-/Bonnummer aus OCR-Text lesen. Gibt String oder null.
-// Mehrstufig: zuerst spezifische Labels (Beleg/Bon/Rechnung/...), dann ein
-// eigenständiges "Nr./No.". Der Wert darf auf derselben ODER der nächsten Zeile
-// stehen. Datum/Uhrzeit/UID/Geldbeträge werden vorher entfernt, damit z.B. nicht
-// die Jahreszahl eines Datums fälschlich als Nummer übernommen wird.
-function detectReceiptNumber(text) {
-  if (!text) return null;
-  const lines = text.split(/\r?\n/).map((l) => l.trim());
-
-  // Datum / Uhrzeit / UID / Beträge aus einem Zeilenrest entfernen
-  const stripNoise = (s) =>
-    (s || '')
-      .replace(/\b\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}\b/g, ' ') // Datum
-      .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')          // Uhrzeit
-      .replace(/\batu\s?\d+/gi, ' ')                          // UID
-      .replace(/\b\d{1,3}(?:\.\d{3})+,\d{2}\b/g, ' ')         // 1.234,00
-      .replace(/\b\d+,\d{2}\b/g, ' ');                        // 12,40
-
-  // Eine Nummer (opt. Buchstaben-Präfix, >=3 Ziffern, mit Trennern) herausziehen
-  const grab = (s) => {
-    const clean = stripNoise(s);
-    const re = /([A-Z]{0,5}[-\/.]?\d{3,}(?:[-\/.][A-Z0-9]+)*)/gi;
-    let m;
-    while ((m = re.exec(clean)) !== null) {
-      const v = m[1].replace(/^[-\/.]+|[-\/.]+$/g, '');
-      if (v && /\d/.test(v)) return v;
-    }
-    return null;
-  };
-
-  // Wert nach dem Label – sonst in den nächsten 1-2 Zeilen (Label/Wert in 2 Spalten)
-  const valueFrom = (rest, i) => {
-    let v = grab(rest);
-    if (v) return v;
-    for (let k = i + 1; k < Math.min(i + 3, lines.length); k++) {
-      if (lines[k]) { v = grab(lines[k]); if (v) return v; }
-    }
-    return null;
-  };
-
-  // Spezifische Labels nach Priorität (Position im Text egal, erster Treffer gewinnt).
-  // Der Lookahead verhindert Teilwort-Treffer (z.B. "Bonus", "Restaurant").
-  const tiers = [
-    /\b(?:beleg|bon|kassenbon|kassabon|belegid)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i,
-    /\b(?:rechnung|faktura|invoice|rg|re)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i,
-    /\b(?:quittung|auftrag|transaktion|vorgang|receipt|ta)s?(?=[\s:#.\-]|nr|nummer|no\b|$)\s*[-.:#]?\s*(?:nr|nummer|no|number|n°)?\.?\s*[:#]?\s*(.*)/i
-  ];
-  for (const re of tiers) {
-    for (let i = 0; i < lines.length; i++) {
-      const m = lines[i].match(re);
-      if (!m) continue;
-      const v = valueFrom(m[1], i);
-      if (v) return v;
-    }
-  }
-
-  // Eigenständiges "Nr./No." – aber NICHT auf Telefon-/UID-/Steuer-/Kunden-Zeilen
-  const genericSkip = /(tel|telefon|fax|iban|bic|uid|atu|steuer|st\.?\s?nr|ust|kunden|kassen[\s-]*id|terminal|\btid\b|\bmid\b)/i;
-  const genericNr = /\b(?:nr|no|n°|nummer|number)\b\.?\s*[:#]?\s*(.*)/i;
-  for (let i = 0; i < lines.length; i++) {
-    if (genericSkip.test(lines[i])) continue;
-    const m = lines[i].match(genericNr);
-    if (!m) continue;
-    const v = valueFrom(m[1], i);
-    if (v) return v;
-  }
-  return null;
-}
-
-// Rechnungsdatum aus OCR-Text lesen (TT.MM.JJJJ / TT/MM/JJJJ / TT.MM.JJ). Gibt 'YYYY-MM-DD' oder null.
-function detectDate(text) {
-  if (!text) return null;
-  const re = /\b(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{2,4})\b/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    let d = parseInt(m[1], 10);
-    let mo = parseInt(m[2], 10);
-    let y = parseInt(m[3], 10);
-    if (y < 100) y += 2000;
-    if (mo < 1 || mo > 12 || d < 1 || d > 31) continue;
-    if (y < 2020 || y > 2035) continue;
-    return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  }
-  return null;
-}
-
 // ---------- Zeit-Helfer ----------
 function monthKeyOf(date) {
   return date.toISOString().slice(0, 7); // YYYY-MM
@@ -612,25 +351,25 @@ function deserializeSession(d) {
   return s;
 }
 
-async function saveSession(userId) {
-  const s = userSessions[userId];
+async function saveSession(sid) {
+  const s = userSessions[sid];
   if (!s || !FIREBASE_DB) return;
   try {
-    await axios.put(`${FIREBASE_DB}/sessions/${userId}.json${FIREBASE_AUTH}`, serializeSession(s));
+    await axios.put(`${FIREBASE_DB}/sessions/${sid}.json${FIREBASE_AUTH}`, serializeSession(s));
   } catch (error) {
     console.error('Session save error:', error.message);
   }
 }
 // Feuer-und-vergiss (blockiert den Handler nicht)
-function persistSession(userId) {
-  saveSession(userId).catch(() => {});
+function persistSession(sid) {
+  saveSession(sid).catch(() => {});
 }
 
-async function dropSession(userId) {
-  delete userSessions[userId];
+async function dropSession(sid) {
+  delete userSessions[sid];
   if (!FIREBASE_DB) return;
   try {
-    await axios.delete(`${FIREBASE_DB}/sessions/${userId}.json${FIREBASE_AUTH}`);
+    await axios.delete(`${FIREBASE_DB}/sessions/${sid}.json${FIREBASE_AUTH}`);
   } catch (error) {
     console.error('Session drop error:', error.message);
   }
@@ -694,15 +433,48 @@ async function loadInvoices() {
   }
 }
 
-// Sucht einen bereits gespeicherten Beleg mit gleicher Beleg-Nr. im selben Chat.
-async function findDuplicate(chatId, receiptNumber) {
-  if (!receiptNumber) return null;
+// ---------- Duplikat-Erkennung ----------
+// Zwei Belege gelten als derselbe, wenn Lieferant + Betrag + Datum + Zahlungsart
+// übereinstimmen. Die Belegnummer allein reicht nicht: sie wird nicht immer
+// korrekt erkannt und ist damit als alleiniges Merkmal unzuverlässig.
+function sameAmount(a, b) {
+  return typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) < 0.005;
+}
+
+function duplicateReason(rec, cand) {
+  if (!rec || !cand) return null;
+
+  const sameSupplier = !!rec.supplier && normalize(rec.supplier) === normalize(cand.supplier);
+
+  // 1) Gleiche Belegnummer beim gleichen Lieferanten -> eindeutig derselbe Beleg
+  if (sameSupplier && rec.receiptNumber && rec.receiptNumber === cand.receiptNumber) {
+    return `gleiche Beleg-Nr. ${rec.receiptNumber} beim selben Lieferanten`;
+  }
+
+  // 2) Lieferant + Betrag + Datum + Zahlungsart identisch
+  if (
+    sameSupplier &&
+    sameAmount(rec.total, cand.total) &&
+    !!rec.invoiceDate &&
+    rec.invoiceDate === cand.invoiceDate &&
+    !!rec.paymentMethod &&
+    rec.paymentMethod === cand.paymentMethod
+  ) {
+    return 'Lieferant, Betrag, Datum und Zahlungsart stimmen überein';
+  }
+
+  return null;
+}
+
+// Sucht einen bereits gespeicherten, gleichen Beleg im selben Chat.
+async function findDuplicate(chatId, cand) {
   const inv = await loadInvoices();
-  return (
-    Object.values(inv || {}).find(
-      (r) => r && r.chatId === chatId && r.receiptNumber === receiptNumber
-    ) || null
-  );
+  for (const rec of Object.values(inv || {})) {
+    if (!rec || rec.chatId !== chatId) continue;
+    const reason = duplicateReason(rec, cand);
+    if (reason) return { rec, reason };
+  }
+  return null;
 }
 
 async function wasSummaryPosted(chatId, month) {
@@ -746,6 +518,44 @@ async function persistLearnedSupplier(entry) {
   }
 }
 
+// --- Wie oft wurde ein Lieferant schon verwendet? ---
+// Damit stehen die häufigen Lieferanten in der Auswahl ganz oben und man muss
+// nicht mehr durch die ganze Liste scrollen.
+const supplierUsage = new Map(); // normalisierter Name -> Anzahl
+
+// Firebase-Schlüssel dürfen . # $ [ ] / nicht enthalten
+function fbKey(name) {
+  return normalize(name).replace(/[.#$[\]/]/g, '_') || '_';
+}
+
+function usageOf(name) {
+  return supplierUsage.get(fbKey(name)) || 0;
+}
+
+async function loadSupplierUsage() {
+  if (!FIREBASE_DB) return;
+  try {
+    const { data } = await axios.get(`${FIREBASE_DB}/supplierUsage.json${FIREBASE_AUTH}`);
+    if (!data) return;
+    for (const [k, v] of Object.entries(data)) {
+      if (typeof v === 'number') supplierUsage.set(k, v);
+    }
+  } catch (error) {
+    console.error('Supplier usage load error:', error.message);
+  }
+}
+
+function bumpSupplierUsage(name) {
+  if (!name) return;
+  const key = fbKey(name);
+  const next = (supplierUsage.get(key) || 0) + 1;
+  supplierUsage.set(key, next);
+  if (!FIREBASE_DB) return;
+  axios
+    .put(`${FIREBASE_DB}/supplierUsage/${key}.json${FIREBASE_AUTH}`, next)
+    .catch((error) => console.error('Supplier usage save error:', error.message));
+}
+
 // Neuen Lieferanten in die laufende Liste übernehmen + dauerhaft speichern.
 // Dedupliziert über den normalisierten Namen / vorhandene Stichwörter.
 // Gibt true zurück, wenn wirklich neu gelernt wurde.
@@ -770,31 +580,68 @@ function learnSupplier(rawName) {
   return true;
 }
 
+// ---------- Beleg-Art ----------
+// Buchhaltungs-Regel im Betrieb:
+//   bar bezahlt              -> Kassenrechnung
+//   Karte oder Überweisung   -> Eingangsrechnung
+// Die Farbpunkte machen den Unterschied beim Durchscrollen sofort sichtbar.
+const KIND_CASH = { key: 'Kassenrechnung', label: 'KASSENRECHNUNG', short: 'Kassenrechnung', icon: '🟢' };
+const KIND_INCOMING = { key: 'Eingangsrechnung', label: 'EINGANGSRECHNUNG', short: 'Eingangsrechnung', icon: '🔵' };
+const KIND_UNKNOWN = { key: 'unbekannt', label: 'BELEG', short: 'Beleg', icon: '⚪' };
+
+function receiptKind(paymentMethod) {
+  if (!paymentMethod) return KIND_UNKNOWN;
+  return paymentMethod === 'Bar' ? KIND_CASH : KIND_INCOMING;
+}
+
+// Symbol passend zur Zahlungsart
+function paymentIcon(paymentMethod) {
+  if (paymentMethod === 'Bar') return '💵';
+  if (String(paymentMethod || '').startsWith('Karte')) return '💳';
+  if (String(paymentMethod || '').startsWith('Ueberwiesen')) return '🏦';
+  return '💰';
+}
+
+// Monat, in dem der Beleg zählt (Rechnungsdatum, sonst aktueller Monat)
+function monthOfRecord(r) {
+  return r.month || (r.invoiceDate ? r.invoiceDate.slice(0, 7) : monthKeyOf(new Date()));
+}
+
 // ---------- Zusammenfassung ----------
+function sumOf(recs) {
+  const withVat = recs.filter((r) => typeof r.vat === 'number');
+  const withTotal = recs.filter((r) => typeof r.total === 'number');
+  return {
+    count: recs.length,
+    vatTotal: Math.round(withVat.reduce((s, r) => s + r.vat, 0) * 100) / 100,
+    grandTotal: Math.round(withTotal.reduce((s, r) => s + r.total, 0) * 100) / 100,
+    missingVat: recs.length - withVat.length,
+    missingTotal: recs.length - withTotal.length
+  };
+}
+
 function summarize(invoicesObj, month, chatId) {
   const recs = Object.values(invoicesObj || {}).filter(
     (r) => r && r.month === month && (chatId == null || r.chatId === chatId)
   );
-  const count = recs.length;
-  const withVat = recs.filter((r) => typeof r.vat === 'number');
-  const withTotal = recs.filter((r) => typeof r.total === 'number');
-  const vatTotal = Math.round(withVat.reduce((s, r) => s + r.vat, 0) * 100) / 100;
-  const grandTotal = Math.round(withTotal.reduce((s, r) => s + r.total, 0) * 100) / 100;
   return {
-    count,
-    vatTotal,
-    grandTotal,
-    missingVat: count - withVat.length,
-    missingTotal: count - withTotal.length
+    ...sumOf(recs),
+    // getrennt nach Beleg-Art – so wie die Belege am Monatsende abgelegt werden
+    cash: sumOf(recs.filter((r) => receiptKind(r.paymentMethod) === KIND_CASH)),
+    incoming: sumOf(recs.filter((r) => receiptKind(r.paymentMethod) === KIND_INCOMING))
   };
 }
 
 function summaryText(label, s) {
   let txt =
     `📊 *Zusammenfassung ${label}*\n\n` +
-    `🧾 Belege: ${s.count}\n` +
-    `💰 Ausgaben gesamt (Brutto): ${euro(s.grandTotal)}\n` +
-    `💶 davon MwSt: ${euro(s.vatTotal)}`;
+    `🧾 Belege gesamt: ${s.count}\n` +
+    `💰 Ausgaben (Brutto): ${euro(s.grandTotal)}\n` +
+    `💶 davon MwSt: ${euro(s.vatTotal)}\n\n` +
+    `${KIND_CASH.icon} *Kassenrechnungen* (bar): ${s.cash.count}\n` +
+    `      ${euro(s.cash.grandTotal)}  ·  MwSt ${euro(s.cash.vatTotal)}\n` +
+    `${KIND_INCOMING.icon} *Eingangsrechnungen* (Karte/Überweisung): ${s.incoming.count}\n` +
+    `      ${euro(s.incoming.grandTotal)}  ·  MwSt ${euro(s.incoming.vatTotal)}`;
   const notes = [];
   if (s.missingTotal > 0) notes.push(`${s.missingTotal}× ohne Betrag`);
   if (s.missingVat > 0) notes.push(`${s.missingVat}× ohne MwSt`);
@@ -833,7 +680,15 @@ bot.help((ctx) => {
   ctx.reply(
     '📸 Foto oder PDF hochladen. Ich lese Lieferant, Betrag, MwSt, Datum und Beleg-Nr. aus – ' +
     'du prüfst die Werte und kannst alles korrigieren, bevor gespeichert wird.\n\n' +
-    '📊 /zusammenfassung – Ausgaben & MwSt des laufenden Monats\n' +
+    '🔍 In der Lieferanten-Auswahl gibt es einen Such-Button – einfach ein paar ' +
+    'Buchstaben tippen statt zu scrollen.\n\n' +
+    '⚠️ Ist ein Beleg mit gleichem Lieferant, Betrag, Datum und Zahlungsart schon ' +
+    'erfasst, warne ich vor dem Speichern.\n\n' +
+    'Unter jedem fertigen PDF steht Monat und Beleg-Art:\n' +
+    '🟢 Kassenrechnung = bar bezahlt\n' +
+    '🔵 Eingangsrechnung = Karte oder Überweisung\n\n' +
+    '📊 /zusammenfassung – Ausgaben & MwSt des laufenden Monats,\n' +
+    '        getrennt nach Kassen- und Eingangsrechnungen\n' +
     '🗂️ /letzter – letzten Beleg ansehen, korrigieren oder löschen'
   );
 });
@@ -851,7 +706,7 @@ bot.command('summary', sendCurrentSummary);
 
 // ---------- Eingang: Foto ----------
 bot.on('photo', async (ctx) => {
-  const userId = ctx.from.id;
+  const sid = sidOf(ctx);
   try {
     const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
     const item = { fileId, messageId: ctx.message.message_id };
@@ -859,11 +714,11 @@ bot.on('photo', async (ctx) => {
 
     // Album (mehrere Fotos auf einmal) -> sammeln und als EINE Rechnung verarbeiten
     if (ctx.message.media_group_id) {
-      bufferMediaGroupItem(ctx, userId, ctx.message.media_group_id, item, meta);
+      bufferMediaGroupItem(ctx, sid, ctx.message.media_group_id, item, meta);
       return;
     }
 
-    await handleIncomingFile(ctx, userId, [item], meta);
+    await handleIncomingFile(ctx, sid, [item], meta);
   } catch (error) {
     console.error('Photo error:', error);
     ctx.reply('❌ Fehler bei der Verarbeitung');
@@ -872,7 +727,7 @@ bot.on('photo', async (ctx) => {
 
 // ---------- Eingang: Dokument (PDF oder Bild-Datei) ----------
 bot.on('document', async (ctx) => {
-  const userId = ctx.from.id;
+  const sid = sidOf(ctx);
   try {
     const doc = ctx.message.document;
     const mime = doc.mime_type || '';
@@ -884,11 +739,11 @@ bot.on('document', async (ctx) => {
     // Album aus Bild-Dateien (mehrere auf einmal) -> als EINE Rechnung verarbeiten.
     // PDFs werden nicht zusammengefasst (jedes PDF ist für sich ein Beleg).
     if (ctx.message.media_group_id && isImage && !isPdf) {
-      bufferMediaGroupItem(ctx, userId, ctx.message.media_group_id, item, meta);
+      bufferMediaGroupItem(ctx, sid, ctx.message.media_group_id, item, meta);
       return;
     }
 
-    await handleIncomingFile(ctx, userId, [item], meta);
+    await handleIncomingFile(ctx, sid, [item], meta);
   } catch (error) {
     console.error('Document error:', error);
     ctx.reply('❌ Fehler bei der Verarbeitung');
@@ -897,8 +752,8 @@ bot.on('document', async (ctx) => {
 
 // Gemeinsame Verarbeitung: Download -> OCR -> Lieferant erkennen
 // items: Array von { fileId, messageId } – bei einem Album mehrere Seiten einer Rechnung.
-async function handleIncomingFile(ctx, userId, items, meta) {
-  userSessions[userId] = {
+async function handleIncomingFile(ctx, sid, items, meta) {
+  userSessions[sid] = {
     fileId: items[0].fileId,
     fileIds: items.map((it) => it.fileId), // alle Seiten -> Neu-Download nach Neustart
     chatId: ctx.chat.id,
@@ -908,7 +763,7 @@ async function handleIncomingFile(ctx, userId, items, meta) {
     images: [],
     ...meta
   };
-  const session = userSessions[userId];
+  const session = userSessions[sid];
 
   const pageCount = items.length;
   await trackReply(
@@ -969,46 +824,32 @@ async function handleIncomingFile(ctx, userId, items, meta) {
   }
 
   session.extractedText = text;
-  session.vat = detectVat(text);
-  session.total = detectTotal(text);
+
+  // Reihenfolge wichtig: das Brutto dient der MwSt-Erkennung als Plausibilitätsgrenze
+  const totalInfo = detectTotalInfo(text);
+  session.total = totalInfo.value;
+  session.totalSource = totalInfo.source;
+
+  const vatInfo = detectVatInfo(text, totalInfo.value);
+  session.vat = vatInfo.value;
+  session.vatSource = vatInfo.source;
+
   session.invoiceDate = detectDate(text);
   session.receiptNumber = detectReceiptNumber(text);
-  persistSession(userId); // Session sofort sichern (auch im Media-Group-Timer-Pfad)
+  persistSession(sid); // Session sofort sichern (auch im Media-Group-Timer-Pfad)
 
-  // Doppelten Beleg erkennen (anhand Beleg-Nr. im selben Chat)
-  const dup = await findDuplicate(session.chatId, session.receiptNumber);
-  if (dup) {
-    await trackReply(
-      ctx,
-      session,
-      `⚠️ *Achtung – Beleg evtl. doppelt!*\n` +
-        `Beleg-Nr. ${mdEscape(session.receiptNumber)} wurde bereits erfasst` +
-        `${dup.invoiceDate ? ` (Datum ${dup.invoiceDate})` : ''}.\n\nTrotzdem verarbeiten?`,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: 'Ja, trotzdem ✅', callback_data: 'dup_continue' },
-              { text: 'Abbrechen ❌', callback_data: 'dup_cancel' }
-            ]
-          ]
-        }
-      }
-    );
-    return; // auf Entscheidung des Users warten
-  }
-
-  proceedAfterOcr(ctx, userId);
+  // Duplikat-Prüfung passiert erst beim Speichern – dort sind Lieferant,
+  // Betrag und Zahlungsart bekannt und die Prüfung ist damit verlässlich.
+  proceedAfterOcr(ctx, sid);
 }
 
 // Lieferant erkennen (oder fragen) und weiter zur Zahlungsart
-function proceedAfterOcr(ctx, userId) {
-  const session = userSessions[userId];
+function proceedAfterOcr(ctx, sid) {
+  const session = userSessions[sid];
   if (!session) return;
 
   // 1) Bekannte Stichwort-Liste (sicherste Erkennung)
-  let supplier = matchSupplier(session.extractedText);
+  let supplier = matchSupplier(session.extractedText, SUPPLIERS);
   let guessed = false;
   // 2) Sonst: Lieferant frei aus dem Beleg-Kopf lesen
   if (!supplier) {
@@ -1036,15 +877,15 @@ function proceedAfterOcr(ctx, userId) {
     });
   } else {
     trackReply(ctx, session, '🤔 Lieferant konnte nicht automatisch erkannt werden.');
-    askForSupplier(ctx, userId);
+    askForSupplier(ctx, sid);
   }
 }
 
 // Erkannten Lieferanten bestätigen -> weiter zur Zahlungsart
 bot.action('supplier_confirm', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
@@ -1054,77 +895,228 @@ bot.action('supplier_confirm', async (ctx) => {
     learnSupplier(session.supplier);
     session.supplierGuessed = false;
   }
-  afterSupplierChosen(ctx, userId);
+  afterSupplierChosen(ctx, sid);
 });
 
 // Erkannten Lieferanten korrigieren -> Liste zur Auswahl zeigen
 bot.action('supplier_change', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  askForSupplier(ctx, userId);
+  askForSupplier(ctx, sid);
 });
 
-// Duplikat-Entscheidung
+// Duplikat-Entscheidung (Prüfung passiert beim Speichern, siehe confirm_save)
 bot.action('dup_continue', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  proceedAfterOcr(ctx, userId);
+  session.duplicateAccepted = true; // nicht nochmal fragen
+  await processInvoice(ctx, sid, session);
 });
 
 bot.action('dup_cancel', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) return;
-  await trackReply(ctx, session, '❌ Abgebrochen – Beleg wurde nicht erneut verarbeitet.');
+  await trackReply(ctx, session, '❌ Abgebrochen – Beleg wurde nicht gespeichert.');
   await cleanupMessages(ctx, session);
-  await dropSession(userId);
+  await dropSession(sid);
 });
 
-// ---------- Lieferant manuell (Fallback) ----------
-function askForSupplier(ctx, userId) {
-  const session = userSessions[userId];
-  const buttons = [];
-  for (let i = 0; i < SUPPLIERS.length; i += 2) {
-    const row = [{ text: SUPPLIERS[i].name, callback_data: `supplier_${i}` }];
-    if (i + 1 < SUPPLIERS.length) {
-      row.push({ text: SUPPLIERS[i + 1].name, callback_data: `supplier_${i + 1}` });
+// ---------- Lieferant auswählen (Suche + Seiten) ----------
+// Die Liste wird mit der Zeit lang. Statt alles auf einmal anzuzeigen:
+// häufigste Lieferanten zuerst, 8 pro Seite, plus Volltext-Suche.
+const SUPPLIER_PAGE_SIZE = 8;
+
+// SUPPLIERS in Anzeige-Reihenfolge, der ursprüngliche Index bleibt als `idx`
+// erhalten (er steckt in den callback_data der Buttons).
+function suppliersForDisplay() {
+  return SUPPLIERS.map((s, idx) => ({ ...s, idx })).sort(
+    (a, b) => usageOf(b.name) - usageOf(a.name) || a.name.localeCompare(b.name, 'de')
+  );
+}
+
+function supplierButtonRows(list) {
+  const rows = [];
+  for (let i = 0; i < list.length; i += 2) {
+    const row = [{ text: list[i].name, callback_data: `supplier_${list[i].idx}` }];
+    if (i + 1 < list.length) {
+      row.push({ text: list[i + 1].name, callback_data: `supplier_${list[i + 1].idx}` });
     }
-    buttons.push(row);
+    rows.push(row);
   }
-  buttons.push([{ text: 'Sonstiges ➕', callback_data: 'supplier_other' }]);
+  return rows;
+}
+
+function askForSupplier(ctx, sid, page = 0) {
+  const session = userSessions[sid];
+  if (!session) return;
+  const all = suppliersForDisplay();
+  const pages = Math.max(1, Math.ceil(all.length / SUPPLIER_PAGE_SIZE));
+  const p = Math.min(Math.max(0, page), pages - 1);
+  const slice = all.slice(p * SUPPLIER_PAGE_SIZE, (p + 1) * SUPPLIER_PAGE_SIZE);
+
+  const buttons = [
+    [
+      { text: '🔍 Suchen', callback_data: 'supplier_find' },
+      { text: '➕ Neuer Lieferant', callback_data: 'supplier_other' }
+    ],
+    ...supplierButtonRows(slice)
+  ];
+
+  if (pages > 1) {
+    buttons.push([
+      { text: '⬅️', callback_data: `supplier_page_${(p - 1 + pages) % pages}` },
+      { text: `Seite ${p + 1}/${pages}`, callback_data: 'supplier_noop' },
+      { text: '➡️', callback_data: `supplier_page_${(p + 1) % pages}` }
+    ]);
+  }
 
   trackReply(ctx, session, '🏪 Welcher Lieferant?', {
     reply_markup: { inline_keyboard: buttons }
   });
 }
 
-bot.action('supplier_other', async (ctx) => {
+// Blättern: bestehende Nachricht umbauen, damit der Chat nicht zugemüllt wird
+bot.action(/^supplier_page_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
-  trackReply(ctx, session, '📝 Schreib den Namen des neuen Lieferanten:');
+  const all = suppliersForDisplay();
+  const pages = Math.max(1, Math.ceil(all.length / SUPPLIER_PAGE_SIZE));
+  const p = Math.min(Math.max(0, parseInt(ctx.match[1], 10)), pages - 1);
+  const slice = all.slice(p * SUPPLIER_PAGE_SIZE, (p + 1) * SUPPLIER_PAGE_SIZE);
+
+  await ctx
+    .editMessageReplyMarkup({
+      inline_keyboard: [
+        [
+          { text: '🔍 Suchen', callback_data: 'supplier_find' },
+          { text: '➕ Neuer Lieferant', callback_data: 'supplier_other' }
+        ],
+        ...supplierButtonRows(slice),
+        [
+          { text: '⬅️', callback_data: `supplier_page_${(p - 1 + pages) % pages}` },
+          { text: `Seite ${p + 1}/${pages}`, callback_data: 'supplier_noop' },
+          { text: '➡️', callback_data: `supplier_page_${(p + 1) % pages}` }
+        ]
+      ]
+    })
+    .catch(() => {});
+});
+
+bot.action('supplier_noop', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+});
+
+// Aus der Suche zurück zur vollständigen Liste
+bot.action('supplier_list', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  if (!userSessions[sid]) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  askForSupplier(ctx, sid, 0);
+});
+
+// Suche starten
+bot.action('supplier_find', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.waitingForSupplierSearch = true;
+  trackReply(ctx, session, '🔍 Tipp ein paar Buchstaben des Lieferanten (z.B. "meg" für Mega Gastro):');
+});
+
+// Suchergebnisse anzeigen
+function showSupplierSearchResults(ctx, sid, query) {
+  const session = userSessions[sid];
+  if (!session) return;
+  const q = normalize(query);
+  const hits = suppliersForDisplay()
+    .filter(
+      (s) =>
+        normalize(s.name).includes(q) ||
+        (s.keywords || []).some((k) => normalize(k).includes(q))
+    )
+    .slice(0, 10);
+
+  session.pendingSupplierName = query;
+
+  if (!hits.length) {
+    trackReply(ctx, session, `🔍 Kein Lieferant mit „${query}" gefunden.`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `➕ „${query}" neu anlegen`, callback_data: 'supplier_use_typed' }],
+          [{ text: '🔍 Nochmal suchen', callback_data: 'supplier_find' }],
+          [{ text: '📋 Ganze Liste', callback_data: 'supplier_list' }]
+        ]
+      }
+    });
+    return;
+  }
+
+  trackReply(ctx, session, `🔍 Treffer für „${query}":`, {
+    reply_markup: {
+      inline_keyboard: [
+        ...supplierButtonRows(hits),
+        [{ text: `➕ „${query}" neu anlegen`, callback_data: 'supplier_use_typed' }],
+        [{ text: '🔍 Nochmal suchen', callback_data: 'supplier_find' }]
+      ]
+    }
+  });
+}
+
+// Getippten Suchbegriff als neuen Lieferanten übernehmen
+bot.action('supplier_use_typed', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
+  if (!session || !session.pendingSupplierName) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.supplier = session.pendingSupplierName;
+  session.supplierGuessed = false;
+  learnSupplier(session.supplier);
+  afterSupplierChosen(ctx, sid);
+});
+
+bot.action('supplier_other', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  trackReply(ctx, session, '📝 Schreib die genaue Firmenbezeichnung des Lieferanten (z.B. „Mega Gastro GmbH"):');
   session.waitingForSupplier = true;
 });
 
 bot.action(/^supplier_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
@@ -1134,38 +1126,65 @@ bot.action(/^supplier_(\d+)$/, async (ctx) => {
   const supplier = SUPPLIERS[index];
   if (!supplier) {
     ctx.reply('❌ Unbekannter Lieferant, bitte erneut wählen.');
-    askForSupplier(ctx, userId);
+    askForSupplier(ctx, sid);
     return;
   }
 
   session.supplier = supplier.name;
-  afterSupplierChosen(ctx, userId);
+  session.supplierGuessed = false;
+  afterSupplierChosen(ctx, sid);
 });
 
 // Text-Handler (für "Sonstiges")
 bot.on('text', async (ctx) => {
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
 
   // Wartet der Bot auf einen Wert (Betrag/Datum/Nr.) aus der Prüfen-Übersicht?
   if (session && session.waitingForField) {
     const field = session.waitingForField;
     const raw = (ctx.message.text || '').trim();
-    session.waitingForField = null;
     session.userMessageIds = session.userMessageIds || [];
     session.userMessageIds.push(ctx.message.message_id);
 
+    let ok = true;
     if (field === 'total' || field === 'vat') {
-      const v = parseAmount(raw.replace(/[€\s]/g, ''));
-      if (!isNaN(v)) session[field] = v;
+      const v = parseAmount(raw);
+      if (!isNaN(v) && v >= 0) {
+        session[field] = v;
+        if (field === 'total') session.totalSource = 'manuell';
+        else session.vatSource = 'manuell';
+      } else {
+        ok = false;
+      }
     } else if (field === 'date') {
-      const iso = detectDate(raw); // versteht TT.MM.JJJJ / TT.MM.JJ
+      // versteht TT.MM.JJJJ / TT.MM.JJ; bei Handeingabe auch ältere Belege (10 Jahre)
+      const iso = detectDate(raw, new Date(), 10 * 365);
       if (iso) session.invoiceDate = iso;
+      else ok = false;
     } else if (field === 'receiptNumber') {
-      session.receiptNumber = raw || null;
+      if (raw) session.receiptNumber = raw;
+      else ok = false;
     }
 
-    showReview(ctx, userId);
+    // Fehleingabe nicht stillschweigend verschlucken, sondern nochmal fragen
+    if (!ok) {
+      await trackReply(ctx, session, `⚠️ „${raw}" konnte ich nicht lesen.\n${FIELD_PROMPTS[field]}`);
+      return; // waitingForField bleibt gesetzt
+    }
+
+    session.waitingForField = null;
+    showReview(ctx, sid);
+    return;
+  }
+
+  // Wartet der Bot auf einen Suchbegriff für die Lieferanten-Liste?
+  if (session && session.waitingForSupplierSearch) {
+    const typed = (ctx.message.text || '').trim();
+    session.waitingForSupplierSearch = false;
+    session.userMessageIds = session.userMessageIds || [];
+    session.userMessageIds.push(ctx.message.message_id);
+    showSupplierSearchResults(ctx, sid, typed);
     return;
   }
 
@@ -1178,8 +1197,9 @@ bot.on('text', async (ctx) => {
     // Getippter (neuer) Lieferant -> dauerhaft in die Liste lernen
     learnSupplier(typed);
     // die getippte Antwort des Users auch wieder aufräumen
-    session.botMessages.push(ctx.message.message_id);
-    afterSupplierChosen(ctx, userId);
+    session.userMessageIds = session.userMessageIds || [];
+    session.userMessageIds.push(ctx.message.message_id);
+    afterSupplierChosen(ctx, sid);
     return;
   }
 
@@ -1195,8 +1215,8 @@ bot.on('text', async (ctx) => {
 });
 
 // ---------- Zahlungsart ----------
-function askForPayment(ctx, userId) {
-  const session = userSessions[userId];
+function askForPayment(ctx, sid) {
+  const session = userSessions[sid];
   trackReply(ctx, session, '💰 Wie wurde bezahlt?', {
     reply_markup: {
       inline_keyboard: [
@@ -1214,21 +1234,21 @@ function askForPayment(ctx, userId) {
 
 bot.action('payment_cash', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Bar';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('payment_transfer', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
@@ -1250,47 +1270,47 @@ bot.action('payment_transfer', async (ctx) => {
 
 bot.action('transfer_bawag', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Ueberwiesen_BAWAG';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('transfer_n26', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Ueberwiesen_N26';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('transfer_viva', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Ueberwiesen_Viva';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('payment_card', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
@@ -1312,41 +1332,41 @@ bot.action('payment_card', async (ctx) => {
 
 bot.action('card_bawag', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Karte_BAWAG';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('card_n26', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Karte_N26';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 bot.action('card_viva', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) {
     ctx.reply('❌ Sitzung abgelaufen');
     return;
   }
   session.paymentMethod = 'Karte_Viva';
   session.account = 'Geschaeftskonto';
-  await showReview(ctx, userId);
+  await showReview(ctx, sid);
 });
 
 // ---------- Werte prüfen / korrigieren ----------
@@ -1381,26 +1401,42 @@ function prettyPayment(p) {
 
 // Nach der Lieferanten-Auswahl: in der Erst-Erfassung -> Zahlungsart,
 // beim Korrigieren (Zahlungsart steht schon) -> zurück zur Übersicht.
-function afterSupplierChosen(ctx, userId) {
-  const session = userSessions[userId];
+function afterSupplierChosen(ctx, sid) {
+  const session = userSessions[sid];
   if (!session) return;
-  if (session.paymentMethod) showReview(ctx, userId);
-  else askForPayment(ctx, userId);
+  if (session.paymentMethod) showReview(ctx, sid);
+  else askForPayment(ctx, sid);
 }
 
-// Übersicht aller erkannten Werte mit Korrektur-Buttons
-function showReview(ctx, userId) {
-  const s = userSessions[userId];
+// Übersicht aller erkannten Werte mit Korrektur-Buttons.
+// Unsichere Werte werden mit ⚠️ markiert, damit man gezielt hinschaut.
+function showReview(ctx, sid) {
+  const s = userSessions[sid];
   if (!s) return;
+
+  // 'fallback' = kein Stichwort gefunden, nur der größte Betrag -> unsicher
+  const totalFlag = s.total === null || s.total === undefined ? ' ⚠️' : s.totalSource === 'fallback' ? ' ⚠️ (unsicher)' : '';
+  const vatFlag = s.vat === null || s.vat === undefined ? ' ⚠️' : '';
+
+  const hints = [];
+  if (s.totalSource === 'fallback') hints.push('Betrag wurde nur geschätzt – bitte vergleichen.');
+  if (vatLooksOff(s.total, s.vat)) hints.push('MwSt passt rechnerisch nicht zum Brutto.');
+  if (!s.invoiceDate) hints.push('Kein Datum erkannt – ohne Datum zählt der Beleg im aktuellen Monat.');
+
+  const kind = receiptKind(s.paymentMethod);
+  const monthKey = s.invoiceDate ? s.invoiceDate.slice(0, 7) : monthKeyOf(new Date());
+
   const txt =
     `📋 *Bitte prüfen:*\n\n` +
     `🏪 Lieferant: ${mdEscape(s.supplier || '—')}\n` +
-    `💶 Brutto: ${fmtAmount(s.total)}\n` +
-    `🧾 MwSt: ${fmtAmount(s.vat)}\n` +
+    `💶 Brutto: ${fmtAmount(s.total)}${totalFlag}\n` +
+    `🧾 MwSt: ${fmtAmount(s.vat)}${vatFlag}\n` +
     `📅 Datum: ${fmtDate(s.invoiceDate)}\n` +
     `🔖 Beleg-Nr.: ${mdEscape(s.receiptNumber || '—')}\n` +
-    `💳 Zahlung: ${mdEscape(prettyPayment(s.paymentMethod))}\n\n` +
-    `Stimmt alles? Sonst einzeln korrigieren:`;
+    `${paymentIcon(s.paymentMethod)} Zahlung: ${mdEscape(prettyPayment(s.paymentMethod))}\n` +
+    `${kind.icon} Art: ${kind.short} · ${monthLabel(monthKey)}\n` +
+    (hints.length ? `\n⚠️ ${hints.join('\n⚠️ ')}\n` : '') +
+    `\nStimmt alles? Sonst einzeln korrigieren:`;
   trackReply(ctx, s, txt, {
     parse_mode: 'Markdown',
     reply_markup: {
@@ -1427,9 +1463,9 @@ function showReview(ctx, userId) {
 // Lieferant ändern -> bekannte Liste / freie Eingabe (kehrt danach zur Übersicht zurück)
 bot.action('edit_supplier', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  if (!userSessions[userId]) return ctx.reply('❌ Sitzung abgelaufen');
-  askForSupplier(ctx, userId);
+  const sid = sidOf(ctx);
+  if (!userSessions[sid]) return ctx.reply('❌ Sitzung abgelaufen');
+  askForSupplier(ctx, sid);
 });
 
 // Betrags-/Datums-/Nummern-Felder: nach Eingabe fragen
@@ -1439,28 +1475,29 @@ const FIELD_PROMPTS = {
   date: '📅 Datum eingeben (TT.MM.JJJJ):',
   receiptNumber: '🔖 Beleg-Nr. eingeben:'
 };
-function askForField(ctx, userId, field) {
-  const session = userSessions[userId];
+function askForField(ctx, sid, field) {
+  const session = userSessions[sid];
   if (!session) return;
   session.waitingForField = field;
   trackReply(ctx, session, FIELD_PROMPTS[field]);
 }
-bot.action('edit_total', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'total'); });
-bot.action('edit_vat', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'vat'); });
-bot.action('edit_date', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'date'); });
-bot.action('edit_receipt', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, ctx.from.id, 'receiptNumber'); });
+bot.action('edit_total', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, sidOf(ctx), 'total'); });
+bot.action('edit_vat', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, sidOf(ctx), 'vat'); });
+bot.action('edit_date', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, sidOf(ctx), 'date'); });
+bot.action('edit_receipt', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); askForField(ctx, sidOf(ctx), 'receiptNumber'); });
 
 // Speichern bestätigen -> neuer Beleg ODER Korrektur eines gespeicherten
 bot.action('confirm_save', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
-  const session = userSessions[userId];
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
   if (!session) return ctx.reply('❌ Sitzung abgelaufen');
 
   if (session.correctingKey) {
     const patch = {
       supplier: session.supplier,
       paymentMethod: session.paymentMethod,
+      kind: receiptKind(session.paymentMethod).key,
       total: typeof session.total === 'number' ? session.total : null,
       vat: typeof session.vat === 'number' ? session.vat : null,
       invoiceDate: session.invoiceDate || null,
@@ -1470,23 +1507,55 @@ bot.action('confirm_save', async (ctx) => {
     await updateInvoice(session.correctingKey, patch);
     await trackReply(ctx, session, '✅ Beleg aktualisiert.');
     await cleanupMessages(ctx, session);
-    await dropSession(userId);
+    await dropSession(sid);
     return;
   }
 
-  await processInvoice(ctx, userId, session);
+  // Duplikat-Prüfung: jetzt sind Lieferant, Betrag, Datum und Zahlungsart bekannt
+  if (!session.duplicateAccepted) {
+    const dup = await findDuplicate(session.chatId, session);
+    if (dup) {
+      await trackReply(
+        ctx,
+        session,
+        `⚠️ *Dieser Beleg ist vermutlich schon erfasst!*\n\n` +
+          `Gefundener Beleg:\n` +
+          `🏪 ${mdEscape(dup.rec.supplier || '—')}\n` +
+          `💶 ${fmtAmount(dup.rec.total)}\n` +
+          `📅 ${fmtDate(dup.rec.invoiceDate)}\n` +
+          `💳 ${mdEscape(prettyPayment(dup.rec.paymentMethod))}\n\n` +
+          `Grund: ${mdEscape(dup.reason)}.\n\nTrotzdem speichern?`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: 'Ja, trotzdem ✅', callback_data: 'dup_continue' },
+                { text: 'Abbrechen ❌', callback_data: 'dup_cancel' }
+              ]
+            ]
+          }
+        }
+      );
+      return; // auf Entscheidung des Users warten
+    }
+  }
+
+  await processInvoice(ctx, sid, session);
 });
 
 // ---------- Letzten Beleg ansehen / korrigieren / löschen ----------
 function lastInvoiceText(r) {
+  const kind = receiptKind(r.paymentMethod);
   return (
     `🗂️ *Letzter Beleg*\n\n` +
+    `${kind.icon} ${kind.short} · ${monthLabel(monthOfRecord(r))}\n` +
     `🏪 ${mdEscape(r.supplier || '—')}\n` +
     `💶 Brutto: ${fmtAmount(r.total)}\n` +
     `🧾 MwSt: ${fmtAmount(r.vat)}\n` +
     `📅 ${fmtDate(r.invoiceDate)}\n` +
     `🔖 ${mdEscape(r.receiptNumber || '—')}\n` +
-    `💳 ${mdEscape(prettyPayment(r.paymentMethod))}`
+    `${paymentIcon(r.paymentMethod)} ${mdEscape(prettyPayment(r.paymentMethod))}`
   );
 }
 
@@ -1521,12 +1590,12 @@ bot.action(/^del_(.+)$/, async (ctx) => {
 // Gespeicherten Beleg zur Korrektur in eine Session laden -> Übersicht (ohne neues PDF)
 bot.action(/^fix_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from.id;
+  const sid = sidOf(ctx);
   const key = ctx.match[1];
   const inv = await loadInvoices();
   const r = inv && inv[key];
   if (!r) return ctx.reply('❌ Beleg nicht mehr gefunden.');
-  userSessions[userId] = {
+  userSessions[sid] = {
     chatId: ctx.chat.id,
     botMessages: [],
     userMessageIds: [],
@@ -1538,11 +1607,11 @@ bot.action(/^fix_(.+)$/, async (ctx) => {
     paymentMethod: r.paymentMethod || null,
     correctingKey: key
   };
-  showReview(ctx, userId);
+  showReview(ctx, sid);
 });
 
 // ---------- Rechnung fertigstellen ----------
-async function processInvoice(ctx, userId, session) {
+async function processInvoice(ctx, sid, session) {
   try {
     const processingMsg = await ctx.reply('⏳ Verarbeite Rechnung...');
     session.botMessages.push(processingMsg.message_id);
@@ -1584,12 +1653,12 @@ async function processInvoice(ctx, userId, session) {
       await ctx.telegram.sendDocument(
         session.chatId,
         { source: fs.createReadStream(otherPath), filename: `${fileName}.${session.ext}` },
-        { caption: buildCaption(fileName, session) }
+        { caption: buildCaption(session) }
       );
       fs.unlinkSync(otherPath);
       await persistInvoice(session);
       await cleanupMessages(ctx, session);
-      await dropSession(userId);
+      await dropSession(sid);
       return;
     }
 
@@ -1597,7 +1666,7 @@ async function processInvoice(ctx, userId, session) {
     await ctx.telegram.sendDocument(
       session.chatId,
       { source: fs.createReadStream(pdfPath), filename: `${fileName}.pdf` },
-      { caption: buildCaption(fileName, session) }
+      { caption: buildCaption(session) }
     );
 
     fs.unlinkSync(pdfPath);
@@ -1608,43 +1677,55 @@ async function processInvoice(ctx, userId, session) {
     // Alle Zwischen-Nachrichten + Original-Upload löschen -> nur PDF bleibt
     await cleanupMessages(ctx, session);
 
-    await dropSession(userId);
+    await dropSession(sid);
   } catch (error) {
     console.error('Process error:', error);
     ctx.reply('❌ Fehler beim Verarbeiten');
-    await dropSession(userId);
+    await dropSession(sid);
   }
 }
 
-function buildCaption(fileName, session) {
-  let caption =
-    `✅ Rechnung verarbeitet!\n\n` +
-    `📄 ${fileName}\n` +
-    `🏪 ${session.supplier}\n` +
-    `💰 ${prettyPayment(session.paymentMethod)}`;
+// Beschriftung unter dem fertigen PDF in der Gruppe.
+// Kopfzeile = Beleg-Art + Monat, damit man beim Ablegen am Monatsende
+// auf einen Blick sieht, wohin der Beleg gehört. Bewusst ohne Markdown:
+// ein Sonderzeichen im Lieferantennamen würde sonst den Versand verhindern.
+function buildCaption(session) {
+  const kind = receiptKind(session.paymentMethod);
+  const monthKey = session.invoiceDate ? session.invoiceDate.slice(0, 7) : monthKeyOf(new Date());
+
+  const lines = [
+    `${kind.icon} ${kind.label}  ·  ${monthLabel(monthKey)}`,
+    '─────────────────────',
+    `🏪 ${session.supplier || '—'}`,
+    `${paymentIcon(session.paymentMethod)} ${prettyPayment(session.paymentMethod)}`
+  ];
+
+  lines.push(
+    session.invoiceDate
+      ? `📅 ${fmtDate(session.invoiceDate)}`
+      : `📅 kein Datum erkannt – zählt zu ${monthLabel(monthKey)}`
+  );
+
+  if (session.receiptNumber) lines.push(`🔖 Beleg-Nr. ${session.receiptNumber}`);
+  if (typeof session.total === 'number') lines.push(`💶 Brutto ${euro(session.total)}`);
+  if (typeof session.vat === 'number') lines.push(`🧾 davon MwSt ${euro(session.vat)}`);
+
   const pages = session.images ? session.images.length : 0;
-  if (pages > 1) {
-    caption += `\n📑 Seiten: ${pages}`;
-  }
-  if (session.receiptNumber) {
-    caption += `\n🧾 Beleg-Nr.: ${session.receiptNumber}`;
-  }
-  if (typeof session.total === 'number') {
-    caption += `\n💶 Brutto: ${euro(session.total)}`;
-  }
-  if (typeof session.vat === 'number') {
-    caption += `\n   davon MwSt: ${euro(session.vat)}`;
-  }
-  return caption;
+  if (pages > 1) lines.push(`📑 ${pages} Seiten`);
+
+  return lines.join('\n');
 }
 
 async function persistInvoice(session) {
   // Monat nach Rechnungsdatum (für korrekte Monats-Zusammenfassung), sonst heute
   const month = session.invoiceDate ? session.invoiceDate.slice(0, 7) : monthKeyOf(new Date());
+  // Häufigkeit mitzählen -> der Lieferant rutscht in der Auswahl nach oben
+  bumpSupplierUsage(session.supplier);
   await saveInvoice({
     chatId: session.chatId,
     supplier: session.supplier,
     paymentMethod: session.paymentMethod,
+    kind: receiptKind(session.paymentMethod).key, // Kassenrechnung / Eingangsrechnung
     total: typeof session.total === 'number' ? session.total : null,
     vat: typeof session.vat === 'number' ? session.vat : null,
     invoiceDate: session.invoiceDate || null,
@@ -1665,12 +1746,22 @@ app.post('/api/webhook', express.json(), async (req, res) => {
   }
 });
 
+// Polling nur im lokalen Betrieb (siehe Sicherheitsregel beim Start unten)
+const usePolling =
+  process.env.USE_POLLING === 'true' && !/^https:\/\/.+/.test(process.env.WEBHOOK_URL || '');
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-06-09-multipage-viva',
-    features: ['ocr', 'crop', 'receiptNr', 'ueberwiesen', 'multipage', 'viva'],
-    firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt'
+    version: '2026-08-14-detection-rework',
+    features: [
+      'ocr', 'crop', 'multipage', 'viva',
+      'receiptNr-v2', 'vat-v2', 'total-cashcheck', 'date-v2',
+      'supplier-search', 'dup-check', 'kassen-eingangsrechnung'
+    ],
+    firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt',
+    suppliers: SUPPLIERS.length,
+    mode: usePolling ? 'polling' : 'webhook'
   });
 });
 
@@ -1738,6 +1829,9 @@ app.listen(PORT, async () => {
     console.error('Lieferanten-Load:', error.message);
   }
 
+  // Wie oft welcher Lieferant verwendet wurde (Sortierung der Auswahl)
+  await loadSupplierUsage();
+
   // Offene Sessions nach einem Neustart zurückholen
   try {
     const restored = await loadSessionsAtStartup();
@@ -1748,15 +1842,29 @@ app.listen(PORT, async () => {
 
   try {
     const webhookUrl = process.env.WEBHOOK_URL;
-    if (webhookUrl && /^https:\/\/.+/.test(webhookUrl)) {
+    const webhookOk = !!webhookUrl && /^https:\/\/.+/.test(webhookUrl);
+
+    // SICHERHEITSREGEL: Polling nur, wenn KEINE gültige WEBHOOK_URL gesetzt ist.
+    // Auf dem Server ist die URL immer gesetzt -> dort bleibt es beim Webhook,
+    // selbst wenn USE_POLLING dort versehentlich auf true steht. Ein Polling-Start
+    // würde den Webhook löschen und den Bot in der Gruppe stumm schalten.
+    if (usePolling && !webhookOk) {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
+      // NICHT awaiten: bot.launch() läuft, bis der Bot gestoppt wird
+      bot.launch().catch((error) => console.error('Polling error:', error.message));
+      console.log('✅ Polling aktiv (USE_POLLING=true, keine WEBHOOK_URL)');
+    } else if (webhookOk) {
       await bot.telegram.setWebhook(webhookUrl);
       console.log('✅ Webhook set!');
+      if (usePolling) {
+        console.log('ℹ️ USE_POLLING=true wird ignoriert, weil WEBHOOK_URL gesetzt ist.');
+      }
     } else {
       // Leere/ungültige URL würde den bestehenden Webhook löschen -> nicht anfassen
       console.log('⚠️ WEBHOOK_URL fehlt/ungültig – bestehender Webhook bleibt unverändert.');
     }
   } catch (error) {
-    console.log(`⚠️ Webhook: ${error.message}`);
+    console.log(`⚠️ Start-Modus: ${error.message}`);
   }
 
   // Monatsbericht: täglich prüfen, am 1. den Vormonat automatisch posten

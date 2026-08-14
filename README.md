@@ -23,7 +23,10 @@ Ein vollautomatischer Telegram-Bot zur Verarbeitung und Verwaltung von Rechnunge
 ```
 zeytoon-receipt-bot/
 ├── api/
-│   └── index.js          # Express Server + Telegram Bot
+│   ├── index.js          # Express Server + Telegram Bot (Ablauf, Telegram, Firebase)
+│   └── detect.js         # Erkennung aus dem OCR-Text (Betrag, MwSt, Beleg-Nr., Datum, Lieferant)
+├── test/
+│   └── detect.test.mjs   # Tests der Erkennung: npm test
 ├── src/
 │   ├── Dashboard.jsx     # React Dashboard
 │   └── Dashboard.css     # Styling
@@ -31,6 +34,75 @@ zeytoon-receipt-bot/
 ├── .env.example
 └── README.md
 ```
+
+### Wie die Werte vom Beleg gelesen werden (`api/detect.js`)
+
+Die Erkennung steckt bewusst in einem eigenen Modul ohne Telegram/Firebase –
+so ist sie mit `npm test` überprüfbar. Die wichtigsten Regeln:
+
+- **Brutto**: Endbetrags-Stichwörter nach Priorität (`Zu zahlen` > `Gesamtbetrag`
+  > `Summe`). `Zwischensumme`, `Trinkgeld` und `Rabatt` werden ausgeschlossen.
+  Gibt es `Gegeben`/`Bar` und `Rückgeld`, wird über die Differenz gegengeprüft –
+  damit wird nie das an der Kassa gegebene Bargeld als Rechnungsbetrag genommen.
+- **MwSt**: zuerst eine ausdrückliche Zeile (`davon MwSt`), sonst wird die
+  Steuerzeile *gerechnet* aufgelöst (welcher Wert passt zu `Netto × Satz`),
+  sonst aus einem einzelnen Steuersatz und dem Brutto ermittelt. Werte über 21 %
+  vom Brutto gelten als unplausibel und werden verworfen.
+- **Beleg-Nr.**: in 5 Stufen, nach Priorität:
+  1. Beleg/Bon/Kassa (`Belegnummer`, `Beleg-Nr.`, `BelegNr`, `Bel.-Nr.`, `Bon-Nr`,
+     `Bonnummer`, `Kassabon`, `Kassenbon`, `Kassenbeleg`, `Kassenzettel`,
+     `Kaufbeleg`, `Zahlungsbeleg`, `Barbeleg`, `Barumsatz Nr.` …)
+  2. Rechnung/Faktura (`Rechnungsnummer`, `Rechnungs-Nr.`, `RG-Nr.`, `Rg.Nr`,
+     `Re.-Nr.`, `AR-Nr.`, `ER-Nr.`, `Faktura-Nr.`, `Invoice No.`,
+     `Abrechnungsnummer`, `Gutschrift Nr.` …)
+  3. Vorgang/Auftrag (`Auftragsnummer`, `Vorgangsnummer`, `Geschäftsfall`,
+     `Transaktionsnummer`, `Trans-Nr.`, `TA-Nr.`, `Quittung`, `Ticket`,
+     `Journal-Nr`, `Buchungsnummer`, `Lieferschein-Nr.`, `Bestellnummer`,
+     `Referenz-Nr.`, `Dokument-Nr.` …)
+  4. ein eigenständiges `Nr.` / `Nummer` / `No.` am Zeilenanfang
+  5. ganz ohne Label nur eindeutige Muster: `#4711` oder `RE-2025-0012`
+  
+  Kurzformen wie `RG`, `RE`, `AR`, `TA`, `LS` gelten nur, wenn `Nr`/`Nummer`
+  dahinter steht. Ignoriert werden Telefon-, UID-/ATU-, Firmenbuch- (`FN`),
+  GISA-, DVR-, Kunden-, Lieferanten-, Vertrags-, Konto-/IBAN-, Kassen-,
+  Terminal-/Trace-, Artikel-/EAN-, TSE-/Signatur-, Serien-, Geräte- und
+  Zählernummern sowie reine Jahreszahlen. Steht zwischen Label und Zahl ein
+  solches Störwort (`Rechnung für Kunden-Nr 4455`), wird nichts übernommen.
+  Ähnliche Wörter lösen keinen Treffer aus: `Bonus` ist kein `Bon`,
+  `Rechnungsdatum` keine `Rechnungsnummer`. Grundsatz bleibt:
+  **lieber keine Nummer als eine falsche.**
+- **Datum**: erkannt werden `03.10.2025`, `03/10/2025`, `03-10-2025`, `3.10.25`,
+  `2025-10-03` (ISO), `03. 10. 2025`, `3. Oktober 2025`, `3. Okt 2025`,
+  `1. Jänner 2025` und englisch `October 3, 2025`.
+  Label-Priorität: `Rechnungsdatum`/`Belegdatum` > `Datum`/`vom`/`am` >
+  `Lieferdatum`. Nie genommen werden Zeilen mit `Zahlbar bis`, `Fällig`,
+  `Zahlungsziel`, `Skonto`, `Gültig bis`, `MHD`. Verworfen werden außerdem
+  unmögliche Tage (31.02.), Datumsangaben in der Zukunft und ältere als 3 Jahre.
+- **Lieferant**: bekanntes Stichwort gewinnt, und zwar der Treffer, der am
+  weitesten oben steht. Findet die Liste nichts, wird die volle Firmenbezeichnung
+  aus dem Belegkopf gelesen (inkl. Rechtsform, auch über zwei Zeilen).
+
+### Beleg-Art: Kassenrechnung vs. Eingangsrechnung
+
+Buchhaltungs-Regel im Betrieb:
+
+| Zahlungsart | Beleg-Art | Kennzeichen |
+| --- | --- | --- |
+| Bar | Kassenrechnung | 🟢 |
+| Karte / Überweisung | Eingangsrechnung | 🔵 |
+
+Die Beschriftung unter jedem fertigen PDF beginnt mit **Beleg-Art + Monat**, z.B.
+`🟢 KASSENRECHNUNG · August 2026`. Damit sieht man beim Durchscrollen in der
+Gruppe sofort, in welchen Monatsordner der Beleg gehört und ob er zur Kassa
+oder zu den Eingangsrechnungen zählt. Die Art wird auch in der Prüf-Übersicht,
+bei `/letzter` und als Feld `kind` in Firebase geführt; `/zusammenfassung`
+weist beide Gruppen getrennt aus.
+
+### Doppelte Belege
+
+Vor dem Speichern wird gewarnt, wenn im selben Chat bereits ein Beleg mit
+**gleichem Lieferant + Betrag + Datum + Zahlungsart** liegt – oder mit gleicher
+Beleg-Nr. beim selben Lieferanten.
 
 ## 🚀 Schnellstart
 
@@ -64,11 +136,27 @@ FIREBASE_API_KEY=<dein-firebase-key>
 WEBHOOK_URL=https://your-app.railway.app/api/webhook
 ```
 
-### 4. **Lokal starten (Testing)**
+### 4. **Lokal starten**
+
+Lokal gibt es keine öffentliche URL für den Webhook – dafür in der `.env`
+`USE_POLLING=true` setzen, dann holt der Bot die Nachrichten selbst ab:
 
 ```bash
 npm run dev
 ```
+
+> Auf dem Server muss `USE_POLLING=false` bleiben, sonst wird der Webhook gelöscht.
+
+### 5. **Tests der Beleg-Erkennung**
+
+```bash
+npm test
+```
+
+Prüft anhand echter Beleg-Beispiele, ob Betrag, MwSt, Beleg-Nr., Datum und
+Lieferant richtig gelesen werden. Wenn ein Beleg falsch erkannt wird: den
+OCR-Text (`DEBUG_OCR=true`) als neuen Testfall in `test/detect.test.mjs`
+aufnehmen, dann die Regel in `api/detect.js` anpassen.
 
 ## 📋 Setup-Anleitung
 
@@ -115,24 +203,30 @@ Deine bestehende Firebase DB nutzen:
 ## 📸 So funktioniert der Workflow
 
 ```
-1. 📸 Benutzer lädt Foto in Telegram
+1. 📸 Benutzer lädt Foto(s) oder PDF in Telegram
+   (mehrere Fotos auf einmal = eine Rechnung mit mehreren Seiten)
    ↓
-2. 🤖 Bot verarbeitet mit Vision API
+2. 🤖 Bot liest den Text mit der Vision API
    ↓
 3. 📋 Bot erkennt automatisch:
-   - Lieferant
-   - MwSt-Satz
-   - Text
+   - Lieferant (bekannte Liste oder Firmenname aus dem Belegkopf)
+   - Brutto-Betrag und MwSt
+   - Rechnungsdatum und Beleg-Nr.
    ↓
 4. ❓ Bot fragt:
-   - Bar oder Karte?
-   - Konto?
+   - Lieferant bestätigen oder ändern (mit Such-Funktion)
+   - Bar, Karte oder Überweisung? Welches Konto?
    ↓
-5. 📄 PDF erstellt & in Firebase gespeichert
+5. 🔍 Prüf-Übersicht: alle Werte einzeln korrigierbar
+   (unsichere Werte sind mit ⚠️ markiert)
    ↓
-6. ✅ Bestätigung in Telegram
+6. ⚠️ Warnung, falls der Beleg schon erfasst wurde
    ↓
-7. 📊 Erscheint im Dashboard
+7. 📄 PDF erstellt & in Firebase gespeichert
+   ↓
+8. ✅ Nur die fertige PDF bleibt im Chat
+   ↓
+9. 📊 Erscheint im Dashboard
 ```
 
 ## 💾 Datenspeicherung
