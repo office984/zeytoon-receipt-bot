@@ -867,6 +867,132 @@ test('Gewichts- und Stückzeilen sind keine Geldbeträge', () => {
   assert.equal(detectTotal('Netto-Gesamtgewicht: 269,94'), null);
 });
 
+test('Billa: Steuersatz-Zeile endet auf "=" und der Wert steht darunter', () => {
+  const bon = `
+BILLA
+Billa AG
+1020 WIEN
+Datum: 11.08.2026
+Zwischensumme
+EUR
+16.96
+3 x Lieblingsprodukt 25%
+-3.25
+Summe
+EUR
+8.71
+Gegeben
+Bar
+10.00
+Restgeld
+EUR
+1.29
+G: 13.00% MwSt von
+7.71 =
+1.00
+Filiale: 00281 Kassa: 5 Bon-Nr: 527
+`;
+  const total = detectTotalInfo(bon);
+  assert.equal(total.value, 8.71, 'Summe, nicht die Zwischensumme');
+  assert.equal(detectVat(bon, total.value), 1, '13 % von 7,71');
+  assert.equal(detectReceiptNumber(bon), '527');
+  assert.equal(guessSupplierFromText(bon, ['zeytoon']), 'Billa AG');
+});
+
+test('Derselbe Steuersatz mehrfach auf dem Beleg wird zusammengezählt', () => {
+  // Metro weist pro Warengruppe eine eigene 20%-Zeile aus.
+  const bon = `
+METRO Cash & Carry Österreich GmbH
+Rechnung 180610020/20260812
+NETTO-WARENWERT:
+391,23
+WARE F:
+NETTOWERT % MWST
+67, 47
+MWST
+BRUTTO
+B=10,00%
+6,75
+74,22
+WARE F:
+264, 49
+C=20,00%
+52,90
+317,39
+WARE F:
+6,99 F= 4,90%
+0,34
+7,33
+WARE NF:
+40, 98 C-20, 00%.
+8,20
+49, 18
+LEERGUT:
+6,00 A= 0.00%
+0,00
+6,00
+LEERGUT:
+5,30 C=20,00%
+1,06
+6,36
+391, 23
+69,25
+460, 48
+SUMME EUR
+460, 48
+`;
+  const total = detectTotalInfo(bon);
+  assert.equal(total.value, 460.48, 'SUMME EUR');
+  // 6,75 + 52,90 + 0,34 + 8,20 + 1,06 = 69,25 (drei getrennte 20%-Gruppen)
+  assert.equal(detectVat(bon, total.value), 69.25);
+});
+
+test('Vordruck listet mehrere Steuersätze, nur einer ist belegt', () => {
+  const rg = `
+Verpackungsteam-GmbH
+Rechnung
+Betrag ohne MWST
+325.00 EUR
+MWST. 1:
+20%
+85.20 EUR
+MWST. 2
+19%
+0.00 EUR
+MWST. 3
+8.1%
+0.00 EUR
+MWST. 4
+17%
+0.00 EUR
+Rechnungsbetrag
+391,20 EUR
+`;
+  const total = detectTotalInfo(rg);
+  assert.equal(total.value, 391.2, 'Rechnungsbetrag');
+  const vat = detectVatInfo(rg, total.value);
+  // 19 %, 8,1 % und 17 % sind mit 0,00 belegt -> nur 20 % gilt
+  assert.equal(vat.value, 65.2, 'aus dem Brutto gerechnet');
+  assert.equal(vat.source, 'computed');
+});
+
+test('"Betrag ohne MwSt" bedeutet Netto, nicht Steuerfreiheit', () => {
+  // Diese Zeile hat einmal dazu geführt, dass eine 20%-Rechnung mit 0,00 MwSt
+  // gespeichert worden wäre.
+  const rg = 'Betrag ohne MwSt 100,00\nRechnungsbetrag 120,00';
+  assert.notEqual(detectVat(rg, 120), 0, 'darf nicht als steuerfrei gelten');
+});
+
+test('Spaltenstriche im Briefkopf gehören nicht in den Firmennamen', () => {
+  const rg = `
+WIEN ENERGIE
+Wien Energie GmbH | 1030 Wien | Postfach 500
+Zeytoon GmbH z.H.
+Ungargasse 6/3
+`;
+  assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'Wien Energie GmbH');
+});
+
 test('Bekannter Lieferant im Kopf schlägt Nennung im Fließtext', () => {
   const suppliers = [
     { name: 'Metro 1110', keywords: ['metro'] },

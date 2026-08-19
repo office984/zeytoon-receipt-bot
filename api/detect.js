@@ -61,8 +61,8 @@ function stripNonMoney(line) {
     .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
     .replace(/\bATU\s*[\d\s]+/gi, ' ')
     .replace(/\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,}\b/g, ' ')  // IBAN
-    .replace(/\d{1,2}(?:[.,]\d{1,2})?\s*%/g, ' ')              // "20,00 %"
-    .replace(/%\s*\d{1,2}(?:[.,]\d{1,2})?/g, ' ');             // "%4,90" (Zeichen davor)
+    .replace(/\d{1,2}(?:[.,]\s?\d{1,2})?\s*%/g, ' ')           // "20,00 %" / "20, 00%"
+    .replace(/%\s*\d{1,2}(?:[.,]\s?\d{1,2})?/g, ' ');          // "%4,90" (Zeichen davor)
 }
 
 // Alle Geldbeträge einer Zeile (ohne Datum/Uhrzeit/Prozent)
@@ -75,7 +75,8 @@ export function amountsOn(line) {
 // Steuersätze einer Zeile, z.B. "20%" / "10,0 %" / "%4.9" (Prozentzeichen davor)
 export function ratesOn(line) {
   const out = [];
-  const re = /(?:(\d{1,2})(?:[.,](\d{1,2}))?\s*%|%\s*(\d{1,2})(?:[.,](\d{1,2}))?)/g;
+  // Das \s? nach dem Komma fängt OCR-Artefakte wie "C-20, 00%" ab.
+  const re = /(?:(\d{1,2})(?:[.,]\s?(\d{1,2}))?\s*%|%\s*(\d{1,2})(?:[.,]\s?(\d{1,2}))?)/g;
   let m;
   while ((m = re.exec(String(line || ''))) !== null) {
     const ganz = m[1] !== undefined ? m[1] : m[3];
@@ -87,9 +88,9 @@ export function ratesOn(line) {
 }
 
 // Zeile besteht im Wesentlichen nur aus einem Geldbetrag
-// ("125.12", "€ 12,50", "12,50 EUR", "*24,00", "24,-")
+// ("125.12", "€ 12,50", "12,50 EUR", "*24,00", "24,-", "7.71 =")
 export function isMoneyLine(line) {
-  return /^\s*[*=]?\s*(?:€|eur|euro)?\s*-?\s*\d[\d.\s]*(?:[.,]\d{2}|,[-–—]{1,2})\s*[*]?\s*(?:€|eur|euro)?\s*$/i.test(
+  return /^\s*[*=:]?\s*(?:€|eur|euro)?\s*-?\s*\d[\d.\s]*(?:[.,]\d{2}|,[-–—]{1,2})\s*[*=:]?\s*(?:€|eur|euro)?\s*[*=:.]?\s*$/i.test(
     String(line || '')
   );
 }
@@ -119,9 +120,11 @@ function mergeColumnBlocks(lines) {
   const out = [];
   let i = 0;
   while (i < lines.length) {
-    // Block A: Textzeilen ganz ohne Betrag
+    // Block A: reine Textzeilen. Bewusst OHNE jede Ziffer – sonst gilt eine
+    // Steuersatz-Zeile wie "B=10,00%" als Bezeichnung und wird mit dem
+    // falschen Betrag verheiratet.
     let a = i;
-    while (a < lines.length && /\p{L}/u.test(lines[a]) && !amountsOn(lines[a]).length) a++;
+    while (a < lines.length && /\p{L}/u.test(lines[a]) && !/\d/.test(lines[a])) a++;
     // Block B: direkt danach nur noch reine Betragszeilen
     let b = a;
     while (b < lines.length && isMoneyLine(lines[b])) b++;
@@ -284,8 +287,10 @@ const SUM_VAT_RE =
 
 // Beleg ohne Umsatzsteuer: innergemeinschaftliche Lieferung, Reverse Charge,
 // Kleinunternehmer. MwSt ist dann 0,00 – und NICHT "nicht gefunden".
+// ACHTUNG: "Betrag ohne MwSt" gehört NICHT hierher – das ist die übliche
+// Bezeichnung für den Nettobetrag und stand schon auf einer Rechnung mit 20 %.
 const TAX_FREE_RE =
-  /(steuerfrei|steuerbefrei|innergemeinschaftliche\s*lieferung|reverse\s*charge|umsatzsteuerbefreit|nicht\s*steuerbar|kleinunternehmer|ohne\s*(mwst|ust)|(mwst|ust|mehrwertsteuer)\.?\s*:?\s*0[.,]0+\s*%)/i;
+  /(steuerfrei|steuerbefrei|innergemeinschaftliche\s*lieferung|reverse\s*charge|umsatzsteuerbefreit|nicht\s*steuerbar|kleinunternehmer|(mwst|ust|mehrwertsteuer)\.?\s*:?\s*0[.,]0+\s*%)/i;
 const VAT_KEY_RE = /(mwst|mw\.?\s?st|mehrwertsteuer|umsatzsteuer|\bu\.?\s?st\.?\b|steuer|\bvat\b|\btax\b)/i;
 const VAT_KEY_SKIP = /(steuer\s*-?\s*nr|st\.?\s?-?\s?nr|\buid\b|\batu\b|finanzamt|steuerberat)/i;
 
@@ -327,7 +332,10 @@ export function detectVatInfo(text, total = null) {
   // 2) Steuersatz-Zeilen rechnerisch auflösen:
   //    Auf "20% 20,00 4,00 24,00" ist genau der Wert die MwSt, für den
   //    netto * satz = wert (oder brutto * satz/(100+satz) = wert) aufgeht.
-  const perRate = new Map();
+  // Ein Beleg kann denselben Satz mehrfach ausweisen (Metro: pro Warengruppe
+  // eine eigene 20%-Zeile). Es zählt jede Zeile, nicht nur die erste je Satz.
+  const rows = [];
+  const seenRows = new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const rates = ratesOn(line);
@@ -345,20 +353,40 @@ export function detectVatInfo(text, total = null) {
     }
     if (a.length < 2) continue;
     let found = null;
+    let gross = null;
     for (const base of a) {
       // Rundungs-Toleranz: 2 Cent, bei großen Beträgen 0,2 %
       const tol = Math.max(0.02, Math.abs(base) * 0.002);
       for (const vat of a) {
         if (base === vat) continue;
-        if (Math.abs((base * r) / 100 - vat) <= tol) { found = vat; break; }
-        if (Math.abs((base * r) / (100 + r) - vat) <= tol) { found = vat; break; }
+        // base ist das Netto -> Brutto = Netto + Steuer
+        if (Math.abs((base * r) / 100 - vat) <= tol) { found = vat; gross = round2(base + vat); break; }
+        // base ist bereits das Brutto
+        if (Math.abs((base * r) / (100 + r) - vat) <= tol) { found = vat; gross = base; break; }
       }
       if (found !== null) break;
     }
-    if (found !== null && !perRate.has(r)) perRate.set(r, found);
+    if (found === null) continue;
+    // Zeilengleiche Wiederholung (Positionen + Zusammenfassung) nur einmal zählen
+    const key = `${r}|${found.toFixed(2)}|${gross.toFixed(2)}`;
+    if (seenRows.has(key)) continue;
+    seenRows.add(key);
+    rows.push({ r, vat: found, gross });
   }
-  if (perRate.size) {
-    const v = round2([...perRate.values()].reduce((a, b) => a + b, 0));
+  if (rows.length) {
+    // Gegenprobe: passen die Brutto-Werte der Steuerzeilen in den Endbetrag,
+    // sind es getrennte Warengruppen -> alle Steuerbeträge addieren.
+    const grossSum = round2(rows.reduce((s, x) => s + x.gross, 0));
+    let v;
+    if (!total || grossSum <= total + 0.02) {
+      v = round2(rows.reduce((s, x) => s + x.vat, 0));
+    } else {
+      // Sonst überschneiden sich die Zeilen (Einzelposten UND Zusammenfassung):
+      // je Satz nur den größten Wert nehmen, sonst wird doppelt gezählt.
+      const max = new Map();
+      for (const x of rows) if (!max.has(x.r) || max.get(x.r) < x.vat) max.set(x.r, x.vat);
+      v = round2([...max.values()].reduce((s, b) => s + b, 0));
+    }
     if (plausible(v)) return { value: v, source: 'rates' };
   }
 
@@ -419,11 +447,28 @@ export function detectVatInfo(text, total = null) {
     if (plausible(mx)) return { value: mx, source: 'keyword' };
   }
 
-  // 5) Nur EIN Steuersatz genannt + Brutto bekannt -> MwSt ausrechnen
-  const allRates = new Set();
-  for (const line of lines) for (const r of ratesOn(line)) allRates.add(r);
-  if (total && allRates.size === 1) {
-    const r = [...allRates][0];
+  // 5) Nur EIN Steuersatz tatsächlich in Verwendung + Brutto bekannt
+  //    -> MwSt ausrechnen. Vordrucke listen oft mehrere Sätze auf, von denen
+  //    alle bis auf einen mit 0,00 belegt sind – die zählen nicht mit.
+  const rateAmounts = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const rs = ratesOn(lines[i]);
+    if (!rs.length) continue;
+    const a = amountsOn(lines[i]);
+    for (let k = i + 1; k < Math.min(i + 4, lines.length) && a.length < 3; k++) {
+      if (!isMoneyLine(lines[k])) break;
+      a.push(...amountsOn(lines[k]));
+    }
+    for (const r of rs) {
+      if (!rateAmounts.has(r)) rateAmounts.set(r, []);
+      rateAmounts.get(r).push(...a);
+    }
+  }
+  const activeRates = [...rateAmounts.entries()]
+    .filter(([, a]) => !a.length || a.some((v) => v !== 0))
+    .map(([r]) => r);
+  if (total && activeRates.length === 1) {
+    const r = activeRates[0];
     const v = round2(total - total / (1 + r / 100));
     if (plausible(v)) return { value: v, source: 'computed' };
   }
@@ -875,7 +920,12 @@ function looksLikeName(line) {
  *   eigene Betrieb – er steht auf Eingangsrechnungen als Empfänger im Kopf).
  */
 export function guessSupplierFromText(text, ignore = []) {
-  const all = toLines(text);
+  // Der senkrechte Strich trennt auf Rechnungen Spalten:
+  // "Wien Energie GmbH | 1030 Wien | Postfach 500" -> drei eigene Angaben.
+  // Ohne Trennung landet die halbe Adresse im Firmennamen.
+  const all = toLines(text).flatMap((l) =>
+    l.includes('|') ? l.split('|').map((p) => p.trim()).filter(Boolean) : [l]
+  );
   if (!all.length) return null;
 
   const ignoreNorm = (ignore || []).map((s) => normalize(s)).filter(Boolean);
