@@ -61,7 +61,8 @@ function stripNonMoney(line) {
     .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
     .replace(/\bATU\s*[\d\s]+/gi, ' ')
     .replace(/\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,}\b/g, ' ')  // IBAN
-    .replace(/\d{1,2}(?:[.,]\d{1,2})?\s*%/g, ' ');
+    .replace(/\d{1,2}(?:[.,]\d{1,2})?\s*%/g, ' ')              // "20,00 %"
+    .replace(/%\s*\d{1,2}(?:[.,]\d{1,2})?/g, ' ');             // "%4,90" (Zeichen davor)
 }
 
 // Alle Geldbeträge einer Zeile (ohne Datum/Uhrzeit/Prozent)
@@ -71,14 +72,16 @@ export function amountsOn(line) {
     .filter((v) => !isNaN(v));
 }
 
-// Steuersätze einer Zeile, z.B. "20%" / "10,0 %"
+// Steuersätze einer Zeile, z.B. "20%" / "10,0 %" / "%4.9" (Prozentzeichen davor)
 export function ratesOn(line) {
   const out = [];
-  const re = /(\d{1,2})(?:[.,](\d{1,2}))?\s*%/g;
+  const re = /(?:(\d{1,2})(?:[.,](\d{1,2}))?\s*%|%\s*(\d{1,2})(?:[.,](\d{1,2}))?)/g;
   let m;
   while ((m = re.exec(String(line || ''))) !== null) {
-    const v = parseFloat(m[2] ? `${m[1]}.${m[2]}` : m[1]);
-    if (!isNaN(v) && v > 0 && v <= 30) out.push(v);
+    const ganz = m[1] !== undefined ? m[1] : m[3];
+    const dez = m[1] !== undefined ? m[2] : m[4];
+    const v = parseFloat(dez ? `${ganz}.${dez}` : ganz);
+    if (!isNaN(v) && v > 0 && v <= 30 && !out.includes(v)) out.push(v);
   }
   return out;
 }
@@ -156,14 +159,16 @@ const PAYMENT_LINE =
   /(kartenzahlung|karten\s*umsatz|bankomat|debitkarte|kreditkarte|maestro|mastercard|\bvisa\b|\bkarte\b|kontaktlos|\bec[-\s]?cash\b|zahlung\b|bezahlt|betrag\s*(in\s*)?(eur|euro|€))/i;
 
 // Zeilen, die NIE der Rechnungsbetrag sind
+// "Brutto-Gesamtgewicht: 269,94" ist ein GEWICHT, kein Geldbetrag – solche
+// Zeilen haben schon echte Belege ruiniert.
 const TOTAL_SKIP =
-  /(zwischensumme|zw\.?\s*summe|zwischen\s*summe|gegeben|geg\.|r(ü|ue)ckgeld|wechselgeld|herausgeld|retour|zur(ü|ue)ck|trinkgeld|rabatt|skonto|gutschein|einzahlung|spende|pfand\b|leergut|guthaben|bonus|ersparnis|sie\s*sparen|rundung|anzahlung|mindestbestell|versand(kosten)?|liefergeb(ü|ue)hr)/i;
+  /(zwischensumme|zw\.?\s*summe|zwischen\s*summe|gegeben|geg\.|r(ü|ue)ckgeld|wechselgeld|herausgeld|retour|zur(ü|ue)ck|trinkgeld|rabatt|skonto|gutschein|einzahlung|spende|pfand\b|leergut|guthaben|bonus|ersparnis|sie\s*sparen|rundung|anzahlung|mindestbestell|versand(kosten)?|liefergeb(ü|ue)hr|gewicht|\bkg\b|\bstk\b|\bstück\b|kolli)/i;
 
 // Zeilen der Steuer-Aufstellung (Netto/MwSt) sind kein Endbetrag ...
 const VAT_LINE = /(netto|mwst|mehrwertsteuer|umsatzsteuer|steuerbetrag|\bu\.?\s?st\.?\b|\bvat\b)/i;
-// ... außer die Zeile nennt ausdrücklich den Endbetrag ("Gesamtbetrag inkl. MwSt")
+// ... außer die Zeile nennt ausdrücklich den Endbetrag ("Gesamt € inkl. MwSt.")
 const STRONG_TOTAL =
-  /(gesamtbetrag|rechnungsbetrag|gesamtsumme|rechnungssumme|zu\s*(zahlen|bezahlen)|zahlbetrag|endbetrag|endsumme)/i;
+  /(gesamtbetrag|rechnungsbetrag|gesamtsumme|rechnungssumme|zu\s*(zahlen|bezahlen)|zahlbetrag|endbetrag|endsumme|(gesamt|summe|total)[^.]{0,12}inkl)/i;
 
 // Bargeld: gegebener Betrag und Rückgeld
 const CASH_GIVEN = /(gegeben|geg\.|bar\s*erhalten|erhalten|barzahlung|^\s*bar\b|^\s*cash\b|kunde\s*gibt)/i;
@@ -218,8 +223,14 @@ export function detectTotalInfo(text) {
       if (!tier.test(line)) continue;
       if (TOTAL_SKIP.test(line)) continue;
       if (VAT_LINE.test(line) && !STRONG_TOTAL.test(line)) continue;
-      let a = amountsOn(line);
+      // Der Betrag steht IMMER hinter seinem Stichwort. Auf
+      // "St.Wert 0% 12,00  Gesamt € inkl. MwSt." gehört die 12,00 zum
+      // Steuersatz links – der Endbetrag kommt erst in einer der Folgezeilen.
+      const at = line.search(tier);
+      let a = amountsOn(at > 0 ? line.slice(at) : line);
       if (!a.length) a = amountFromNextLines(lines, i);
+      // Notfall: hat die OCR die Spalten vertauscht, zählt doch die ganze Zeile
+      if (!a.length && at > 0) a = amountsOn(line);
       // In einer Tabellenzeile ("Summe 24,00 20,00 4,00") ist Brutto der größte Wert
       if (a.length) cands.push(Math.max(...a));
     }
@@ -265,8 +276,16 @@ export function detectTotal(text) {
 
 // ---------- MwSt ----------
 
+// ACHTUNG beim "inkl."-Zweig: "Gesamt inkl. MwSt. 120,00" nennt den BRUTTO-Betrag,
+// nicht die Steuer. Nur mit ausdrücklichem Steuersatz ("inkl. 20% MwSt 4,00")
+// ist der Betrag auf der Zeile wirklich die MwSt.
 const SUM_VAT_RE =
-  /(summe\s*(mwst|ust|steuer|vat)|(mwst|ust|steuer|vat)\s*[-\s]?(summe|betrag|gesamt|total)|gesamt\s*(mwst|ust|steuer)|enthaltene?\s*(mwst|ust|steuer)|darin\s*enthalten|davon\s*(mwst|ust|steuer)|zzgl\.?\s*(mwst|ust)|inkl\.?\s*(mwst|ust|vat|\d{1,2}\s*%\s*(mwst|ust)))/i;
+  /(summe\s*(mwst|ust|steuer|vat)|(mwst|ust|steuer|vat)\s*[-\s]?(summe|betrag|gesamt|total)|gesamt\s*(mwst|ust|steuer)|enthaltene?\s*(mwst|ust|steuer)|darin\s*enthalten|davon\s*(mwst|ust|steuer)|zzgl\.?\s*\d{1,2}(?:[.,]\d{1,2})?\s*%\s*(mwst|ust)|inkl\.?\s*\d{1,2}(?:[.,]\d{1,2})?\s*%\s*(mwst|ust))/i;
+
+// Beleg ohne Umsatzsteuer: innergemeinschaftliche Lieferung, Reverse Charge,
+// Kleinunternehmer. MwSt ist dann 0,00 – und NICHT "nicht gefunden".
+const TAX_FREE_RE =
+  /(steuerfrei|steuerbefrei|innergemeinschaftliche\s*lieferung|reverse\s*charge|umsatzsteuerbefreit|nicht\s*steuerbar|kleinunternehmer|ohne\s*(mwst|ust)|(mwst|ust|mehrwertsteuer)\.?\s*:?\s*0[.,]0+\s*%)/i;
 const VAT_KEY_RE = /(mwst|mw\.?\s?st|mehrwertsteuer|umsatzsteuer|\bu\.?\s?st\.?\b|steuer|\bvat\b|\btax\b)/i;
 const VAT_KEY_SKIP = /(steuer\s*-?\s*nr|st\.?\s?-?\s?nr|\buid\b|\batu\b|finanzamt|steuerberat)/i;
 
@@ -309,11 +328,21 @@ export function detectVatInfo(text, total = null) {
   //    Auf "20% 20,00 4,00 24,00" ist genau der Wert die MwSt, für den
   //    netto * satz = wert (oder brutto * satz/(100+satz) = wert) aufgeht.
   const perRate = new Map();
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const rates = ratesOn(line);
     if (rates.length !== 1) continue;
     const r = rates[0];
     const a = amountsOn(line);
+    // Steuerzeilen sind oft über mehrere Zeilen verteilt:
+    //   "86,55 B=10,00%" / "8,66" / "95,21"
+    // Die reinen Betragszeilen direkt darunter gehören noch dazu.
+    if (a.length < 2) {
+      for (let k = i + 1; k < Math.min(i + 4, lines.length); k++) {
+        if (!isMoneyLine(lines[k])) break;
+        a.push(...amountsOn(lines[k]));
+      }
+    }
     if (a.length < 2) continue;
     let found = null;
     for (const base of a) {
@@ -365,12 +394,16 @@ export function detectVatInfo(text, total = null) {
   // 4) Zeilen mit MwSt-Stichwort: der kleinste Betrag der Zeile ist die Steuer.
   //    Der Wert steht auch mal erst in der Folgezeile ("MwSt 20%" / "4,00").
   const vals = [];
+  let sawZeroVat = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!VAT_KEY_RE.test(line) || VAT_KEY_SKIP.test(line)) continue;
     let a = amountsOn(line);
     if (!a.length && isMoneyLine(lines[i + 1] || '')) a = amountsOn(lines[i + 1]);
-    if (a.length) vals.push(Math.min(...a));
+    if (!a.length) continue;
+    const min = Math.min(...a);
+    if (min === 0) sawZeroVat = true;
+    else vals.push(min);
   }
   if (vals.length === 1 && plausible(vals[0])) return { value: vals[0], source: 'keyword' };
   if (vals.length > 1) {
@@ -408,6 +441,11 @@ export function detectVatInfo(text, total = null) {
     }
   }
 
+  // 7) Kein Steuerbetrag gefunden, aber der Beleg weist ausdrücklich 0 % aus
+  //    (innergemeinschaftliche Lieferung, Reverse Charge, Kleinunternehmer).
+  //    Dann ist die MwSt 0,00 – das ist ein Ergebnis, kein Fehlschlag.
+  if (sawZeroVat || TAX_FREE_RE.test(text)) return { value: 0, source: 'tax-free' };
+
   return { value: null, source: null };
 }
 
@@ -418,7 +456,9 @@ export function detectVat(text, total = null) {
 // MwSt/Brutto-Verhältnis plausibel? (AT: 10% -> 9,1%, 20% -> 16,7% vom Brutto)
 export function vatLooksOff(total, vat) {
   if (typeof total !== 'number' || typeof vat !== 'number') return false;
-  if (total <= 0 || vat <= 0) return true;
+  // 0,00 ist bei steuerfreien Belegen (EU-Lieferung, Reverse Charge) korrekt
+  if (vat === 0) return false;
+  if (total <= 0 || vat < 0) return true;
   const ratio = vat / total;
   return ratio < 0.03 || ratio > 0.19;
 }

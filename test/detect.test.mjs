@@ -12,6 +12,7 @@ import {
   supplierKeywords,
   parseAmount,
   amountsOn,
+  ratesOn,
   euro
 } from '../api/detect.js';
 
@@ -724,6 +725,146 @@ inkl. 10% MwSt
 `,
     { lieferant: 'Gasthaus Zum Gusto', brutto: 11, mwst: 1, datum: '2025-10-05', nummer: '42' }
   );
+});
+
+// ---------- Echte Belege, die der Bot falsch gelesen hatte ----------
+// Die Texte sind gekürzte, aber zeilengetreue Auszüge der Google-Vision-Ausgabe.
+
+test('EU-Lieferant ohne Umsatzsteuer: MwSt ist 0,00 und nicht "unbekannt"', () => {
+  const rg = `
+reichelt elektronik GmbH
+Elektronikring 1 26452 Sande
+ZEYTOON GMBH
+UNGARGASSE 6/1
+1030 WIEN
+Rechnung:
+Kunde:
+3081253
+57312126P
+Datum:
+13.08.2026
+Steuerfreie innergemeinschaftliche Lieferung
+Warenwert
+260,54
+Versandkosten
+5,79
+Nettowert
+266,33
+Mwst. 0,0%
+0,00
+Endbetrag (EUR)
+266,33
+Betrag per Kreditkarte bezahlt.
+`;
+  const total = detectTotalInfo(rg);
+  assert.equal(total.value, 266.33, 'Endbetrag');
+  const vat = detectVatInfo(rg, total.value);
+  assert.equal(vat.value, 0, 'MwSt 0,00 bei steuerfreier Lieferung');
+  assert.equal(vat.source, 'tax-free');
+  assert.equal(detectReceiptNumber(rg), '3081253', 'Rechnung, nicht Kundennummer');
+  assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'reichelt elektronik GmbH');
+});
+
+test('Metro-Beleg: Steuersätze stehen über mehrere Zeilen verteilt', () => {
+  const bon = `
+METRO Cash & Carry Österreich GmbH
+Metro Platz 1
+A-2331 Vösendorf
+UID-Nr.: ATU19424905
+Rechnung 180600072/20260818
+Zeytoon GmbH
+Kunde: 018 087518 02 SC
+NETTO-WARENWERT:
+279,05
+9,36
+NETTOWERT % MWST
+MWST
+BRUTTO
+WARE F:
+86, 55 B=10,00%
+8,66
+95,21
+WARE F:
+94, 87
+C=20,00%
+18,97
+113,84
+WARE F:
+97, 38
+F= 4,90%
+4,77
+102,15
+LEERGUT:
+0,25 A= 0,00%
+0,00
+0,25
+279,05
+32,40
+311,45
+SUMME EUR
+311,45
+Karte EUR
+311,45
+`;
+  const total = detectTotalInfo(bon);
+  assert.equal(total.value, 311.45, 'SUMME EUR');
+  // 8,66 + 18,97 + 4,77 + 0,00 = 32,40
+  assert.equal(detectVat(bon, total.value), 32.4, 'MwSt aller Steuersätze');
+  assert.equal(detectReceiptNumber(bon), '180600072/20260818');
+});
+
+test('Orient-Rechnung: Stichwort am Zeilenende, Gewichtszeile daneben', () => {
+  const rg = `
+ZEYTOON GMBH
+UNGARGASSE 6/3
+WIEN
+1030
+Rechnung
+orient
+MARKETINGSERVICE GES.M.B.H. Nfg. KG
+Nr. 45274727
+Belegdatum 18. August 2026
+Total Karton: 26
+Total Stück: 52
+Total KG: 0
+Zwischensumme
+915,95
+St.Wert %4.9
+245,13 MwSt. %4.9
+12,01
+Brutto-Gesamtgewicht:269,94
+St.Wert %10
+550,08 MwSt. %10
+55,01
+Netto-Gesamtgewicht: 269,94
+St.Wert %20
+108,74 MwSt. %20
+21,75
+St.Wert 0%
+12,00 Gesamt € inkl. MwSt.
+Zahlen mit QR Code:
+1 004,72
+`;
+  const total = detectTotalInfo(rg);
+  // NICHT 269,94 (das ist das Gesamtgewicht) und nicht 12,00 (St.Wert 0%)
+  assert.equal(total.value, 1004.72, 'Gesamt inkl. MwSt.');
+  // 12,01 + 55,01 + 21,75 = 88,77; Gegenprobe: 915,95 + 88,77 = 1.004,72
+  assert.equal(detectVat(rg, total.value), 88.77, 'MwSt aller drei Sätze');
+  assert.equal(detectReceiptNumber(rg), '45274727');
+  assert.equal(detectDate(rg, new Date('2026-08-19T12:00:00Z')), '2026-08-18');
+  assert.equal(matchSupplier(rg, [{ name: 'Orient GmbH', keywords: ['orient'] }]), 'Orient GmbH');
+});
+
+test('Prozentzeichen vor der Zahl ("%4.9") wird als Steuersatz gelesen', () => {
+  assert.deepEqual(ratesOn('St.Wert %4.9'), [4.9]);
+  assert.deepEqual(ratesOn('MwSt 20%'), [20]);
+  // gleicher Satz zweimal in einer Zeile zählt einmal
+  assert.deepEqual(ratesOn('St.Wert %10 550,08 MwSt. %10'), [10]);
+});
+
+test('Gewichts- und Stückzeilen sind keine Geldbeträge', () => {
+  assert.equal(detectTotal('Brutto-Gesamtgewicht:269,94\nSumme 44,90'), 44.9);
+  assert.equal(detectTotal('Netto-Gesamtgewicht: 269,94'), null);
 });
 
 test('Bekannter Lieferant im Kopf schlägt Nennung im Fließtext', () => {

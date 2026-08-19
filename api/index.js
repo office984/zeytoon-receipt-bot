@@ -20,6 +20,7 @@ import {
   supplierKeywords,
   vatLooksOff
 } from './detect.js';
+import { BASE_SUPPLIERS } from './suppliers.js';
 
 dotenv.config();
 
@@ -34,31 +35,9 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Lieferanten + Stichwörter zur automatischen Erkennung aus dem OCR-Text.
-// keywords sind kleingeschrieben; Treffer mit Wortgrenzen, längster Treffer gewinnt.
-// `let`, weil die Liste zur Laufzeit um neu gelernte Lieferanten wächst (siehe learnSupplier).
-let SUPPLIERS = [
-  { name: 'Metro 1110', keywords: ['metro'] },
-  { name: 'GastroGenius GmbH', keywords: ['gastrogenius', 'gastro genius'] },
-  { name: 'Sahan Einzelhandel GmbH', keywords: ['sahan'] },
-  { name: 'Rubin GmbH', keywords: ['rubin'] },
-  { name: 'Orient GmbH', keywords: ['orient'] },
-  { name: 'Shirinagha Hussaini (Tandori Brot)', keywords: ['shirinagha', 'hussaini', 'tandori'] },
-  { name: 'Spar', keywords: ['spar'] },
-  { name: 'Dr. Falafel', keywords: ['falafel'] },
-  { name: 'IG Gastro', keywords: ['ig gastro'] },
-  { name: 'Kaffee Partner', keywords: ['kaffee partner'] },
-  { name: 'AKM', keywords: ['akm'] },
-  { name: 'Hofer', keywords: ['hofer'] },
-  { name: 'JET Tankstelle', keywords: ['jet tankstelle', 'jet '] },
-  { name: 'Interspar', keywords: ['interspar'] },
-  { name: 'Alizadeh Ashouri', keywords: ['alizadeh', 'ashouri'] },
-  { name: 'Reza Davoudi', keywords: ['reza davoudi', 'davoudi'] },
-  { name: 'Etsan', keywords: ['etsan'] },
-  { name: 'T-Mobile', keywords: ['t-mobile', 't mobile', 'tmobile', 'magenta telekom'] },
-  { name: 'SWV Wien', keywords: ['swv wien', 'swv'] },
-  { name: 'Mega Gastro GmbH', keywords: ['mega gastro', 'megagastro'] }
-];
+// Grundliste liegt in api/suppliers.js (wird auch vom Prüf-Werkzeug genutzt).
+// Eigene Kopie, weil die Liste zur Laufzeit um gelernte Lieferanten wächst.
+const SUPPLIERS = [...BASE_SUPPLIERS];
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const userSessions = {};
@@ -1865,10 +1844,11 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-08-19-detection-v3',
+    version: '2026-08-19-detection-v4',
     features: [
       'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
-      'receiptNr-v3', 'vat-v3', 'total-columns', 'total-payment-line', 'date-v2',
+      'receiptNr-v3', 'vat-v4', 'vat-multiline-rates', 'vat-tax-free',
+      'total-columns', 'total-payment-line', 'total-label-order', 'date-v2',
       'supplier-v3', 'supplier-search', 'dup-check', 'kassen-eingangsrechnung'
     ],
     firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt',
