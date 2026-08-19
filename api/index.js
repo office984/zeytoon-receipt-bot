@@ -17,6 +17,7 @@ import {
   detectDate,
   guessSupplierFromText,
   matchSupplier,
+  supplierKeywords,
   vatLooksOff
 } from './detect.js';
 
@@ -139,29 +140,120 @@ async function cleanupMessages(ctx, session) {
 // Erkennungs-Logik (normalize, matchSupplier, guessSupplierFromText, Beträge,
 // MwSt, Belegnummer, Datum) liegt in ./detect.js – dort auch mit Tests abgedeckt.
 
-// OCR für Bilder über Google Vision REST API (mit API-Key)
+// Der eigene Betrieb steht auf Eingangsrechnungen im Kopf (als Empfänger) und
+// darf nie als Lieferant vorgeschlagen werden. Über OWN_COMPANY erweiterbar.
+const OWN_COMPANY_WORDS = (process.env.OWN_COMPANY || 'zeytoon')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Wie verlässlich ist ein erkannter Wert? Höher = besser.
+// Wird gebraucht, um die Ergebnisse der zwei OCR-Verfahren zu vergleichen.
+const TOTAL_RANK = { 'keyword+cash': 6, keyword: 5, cash: 4, payment: 3, fallback: 1 };
+const VAT_RANK = { sum: 6, rates: 5, table: 4, 'keyword-sum': 3, keyword: 3, computed: 2, 'net-diff': 2 };
+
+function extractFrom(text) {
+  // Reihenfolge wichtig: das Brutto dient der MwSt-Erkennung als Plausibilitätsgrenze
+  const total = detectTotalInfo(text);
+  const vat = detectVatInfo(text, total.value);
+  return {
+    total: total.value,
+    totalSource: total.source,
+    vat: vat.value,
+    vatSource: vat.source,
+    invoiceDate: detectDate(text),
+    receiptNumber: detectReceiptNumber(text)
+  };
+}
+
+/**
+ * Beide OCR-Lesarten auswerten und pro Feld das sicherere Ergebnis nehmen.
+ * Ein Beleg, dessen Summe die eine Lesart verschluckt, wird von der anderen
+ * oft sauber erkannt – vor allem bei mehrspaltigen Rechnungen.
+ */
+function bestExtraction(texts) {
+  const cands = texts.filter((t) => t && t.trim()).map(extractFrom);
+  if (!cands.length) return extractFrom('');
+
+  const out = { ...cands[0] };
+  for (const c of cands.slice(1)) {
+    if ((TOTAL_RANK[c.totalSource] || 0) > (TOTAL_RANK[out.totalSource] || 0)) {
+      out.total = c.total;
+      out.totalSource = c.totalSource;
+      // MwSt hängt am Brutto -> gleich mitnehmen, sonst passen die beiden nicht zusammen
+      if ((VAT_RANK[c.vatSource] || 0) >= (VAT_RANK[out.vatSource] || 0)) {
+        out.vat = c.vat;
+        out.vatSource = c.vatSource;
+      }
+    } else if ((VAT_RANK[c.vatSource] || 0) > (VAT_RANK[out.vatSource] || 0)) {
+      out.vat = c.vat;
+      out.vatSource = c.vatSource;
+    }
+    if (!out.invoiceDate && c.invoiceDate) out.invoiceDate = c.invoiceDate;
+    if (!out.receiptNumber && c.receiptNumber) out.receiptNumber = c.receiptNumber;
+  }
+
+  // Passt die MwSt rechnerisch nicht zum (evtl. korrigierten) Brutto, lieber
+  // nachrechnen als einen falschen Wert stehen lassen.
+  if (out.total && out.vat && vatLooksOff(out.total, out.vat)) {
+    const alt = cands
+      .map((c) => c.vat)
+      .find((v) => typeof v === 'number' && !vatLooksOff(out.total, v));
+    if (alt !== undefined) out.vat = alt;
+  }
+  return out;
+}
+
+/** Lieferant über beide OCR-Lesarten suchen: erst bekannte Liste, dann frei lesen. */
+function findSupplier(texts) {
+  const list = texts.filter((t) => t && t.trim());
+  for (const t of list) {
+    const hit = matchSupplier(t, SUPPLIERS);
+    if (hit) return { supplier: hit, guessed: false };
+  }
+  for (const t of list) {
+    const hit = guessSupplierFromText(t, OWN_COMPANY_WORDS);
+    if (hit) return { supplier: hit, guessed: true };
+  }
+  return { supplier: null, guessed: false };
+}
+
+// Sprach-Hinweise: ohne sie liest Vision Umlaute und "ß" auf Kassenzetteln
+// deutlich schlechter – und damit auch Stichwörter wie "Rückgeld" oder "Straße".
+const VISION_CONTEXT = { languageHints: ['de', 'en'] };
+
+// OCR für Bilder über Google Vision REST API (mit API-Key).
+// Es werden BEIDE Verfahren angefragt:
+//   DOCUMENT_TEXT_DETECTION – besser bei dicht bedruckten Rechnungen (A4)
+//   TEXT_DETECTION          – besser bei kurzen, schiefen Kassabons
+// Die beiden Ergebnisse zerlegen den Beleg unterschiedlich in Zeilen; wir werten
+// später beide aus und nehmen pro Feld das sicherere Ergebnis (siehe bestExtraction).
 async function ocrImage(base64) {
   const url = `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GOOGLE_VISION_API_KEY}`;
   const { data } = await axios.post(url, {
     requests: [
-      {
-        image: { content: base64 },
-        features: [{ type: 'TEXT_DETECTION' }]
-      }
+      { image: { content: base64 }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }], imageContext: VISION_CONTEXT },
+      { image: { content: base64 }, features: [{ type: 'TEXT_DETECTION' }], imageContext: VISION_CONTEXT }
     ]
   });
-  const res = data.responses?.[0];
-  const text = res?.fullTextAnnotation?.text || res?.textAnnotations?.[0]?.description || '';
+  const [docRes, sparseRes] = data.responses || [];
+  const docText = docRes?.fullTextAnnotation?.text || '';
+  const sparseText = sparseRes?.fullTextAnnotation?.text || sparseRes?.textAnnotations?.[0]?.description || '';
 
   // Bounding-Box über den GESAMTEN erkannten Text = ungefähr die Rechnung
   let bbox = null;
-  const verts = res?.textAnnotations?.[0]?.boundingPoly?.vertices;
+  const verts =
+    sparseRes?.textAnnotations?.[0]?.boundingPoly?.vertices ||
+    docRes?.textAnnotations?.[0]?.boundingPoly?.vertices;
   if (verts && verts.length) {
     const xs = verts.map((v) => v.x || 0);
     const ys = verts.map((v) => v.y || 0);
     bbox = { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
   }
-  return { text, bbox };
+
+  const text = docText || sparseText;
+  const altText = sparseText && sparseText !== docText ? sparseText : '';
+  return { text, altText, bbox };
 }
 
 // Bild auf den Rechnungs-Bereich zuschneiden (Hintergrund weg). Fällt bei Fehler auf Original zurück.
@@ -212,7 +304,8 @@ async function ocrPdf(base64) {
     requests: [
       {
         inputConfig: { content: base64, mimeType: 'application/pdf' },
-        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+        imageContext: VISION_CONTEXT
       }
     ]
   });
@@ -335,7 +428,8 @@ async function deleteInvoiceByKey(key) {
 function serializeSession(s) {
   const out = {};
   for (const [k, v] of Object.entries(s)) {
-    if (k === 'buffer' || v === undefined) continue;
+    // extractedTextAlt wird nur direkt nach der OCR gebraucht -> nicht mitspeichern
+    if (k === 'buffer' || k === 'extractedTextAlt' || v === undefined) continue;
     if (k === 'images') {
       out.images = (v || []).map((im) => ({ ext: im.ext || null, cropBox: im.cropBox || null }));
       continue;
@@ -568,10 +662,10 @@ function learnSupplier(rawName) {
   );
   if (exists) return false;
 
-  // Stichwörter ableiten: voller Name + (falls markant) erstes Wort
-  const keywords = [norm];
-  const firstWord = norm.split(' ').find((w) => w.length >= 5 && !/^\d+$/.test(w));
-  if (firstWord && firstWord !== norm) keywords.push(firstWord);
+  // Stichwörter ableiten (voller Name + markantes Einzelwort, ohne
+  // Allerweltswörter wie "hotel"/"gastro" – die würden fremde Belege einfangen)
+  const keywords = supplierKeywords(name);
+  if (!keywords.length) return false;
 
   const entry = { name, keywords };
   SUPPLIERS.push(entry);          // sofort in dieser Session nutzbar
@@ -774,18 +868,22 @@ async function handleIncomingFile(ctx, sid, items, meta) {
 
   // OCR ausführen (Fehler -> trotzdem manuell weiter)
   let text = '';
+  let altText = '';
   let ocrError = null;
   try {
     if (meta.isImage) {
       // Jede Seite herunterladen + per OCR lesen; Texte aller Seiten zusammenführen
       const texts = [];
+      const altTexts = [];
       for (const it of items) {
         const { buffer, ext } = await downloadTelegramFile(ctx, it.fileId);
         let pageText = '';
+        let pageAlt = '';
         let pageBox = null;
         try {
           const r = await ocrImage(buffer.toString('base64'));
           pageText = r.text;
+          pageAlt = r.altText;
           pageBox = r.bbox;
         } catch (error) {
           ocrError = error.response?.data ? JSON.stringify(error.response.data) : error.message;
@@ -793,8 +891,10 @@ async function handleIncomingFile(ctx, sid, items, meta) {
         }
         session.images.push({ buffer, ext, cropBox: pageBox });
         if (pageText) texts.push(pageText);
+        if (pageAlt) altTexts.push(pageAlt);
       }
       text = texts.join('\n');
+      altText = altTexts.join('\n');
       // Rückwärtskompatibel: erste Seite auch als buffer/ext/cropBox bereitstellen
       if (session.images[0]) {
         session.buffer = session.images[0].buffer;
@@ -824,18 +924,20 @@ async function handleIncomingFile(ctx, sid, items, meta) {
   }
 
   session.extractedText = text;
+  session.extractedTextAlt = altText;
 
-  // Reihenfolge wichtig: das Brutto dient der MwSt-Erkennung als Plausibilitätsgrenze
-  const totalInfo = detectTotalInfo(text);
-  session.total = totalInfo.value;
-  session.totalSource = totalInfo.source;
-
-  const vatInfo = detectVatInfo(text, totalInfo.value);
-  session.vat = vatInfo.value;
-  session.vatSource = vatInfo.source;
-
-  session.invoiceDate = detectDate(text);
-  session.receiptNumber = detectReceiptNumber(text);
+  // Beide OCR-Lesarten auswerten, pro Feld das sicherere Ergebnis übernehmen
+  const found = bestExtraction([text, altText]);
+  session.total = found.total;
+  session.totalSource = found.totalSource;
+  session.vat = found.vat;
+  session.vatSource = found.vatSource;
+  session.invoiceDate = found.invoiceDate;
+  session.receiptNumber = found.receiptNumber;
+  console.log(
+    `Erkannt: Brutto=${found.total} (${found.totalSource}) MwSt=${found.vat} (${found.vatSource}) ` +
+    `Datum=${found.invoiceDate} Nr=${found.receiptNumber}`
+  );
   persistSession(sid); // Session sofort sichern (auch im Media-Group-Timer-Pfad)
 
   // Duplikat-Prüfung passiert erst beim Speichern – dort sind Lieferant,
@@ -848,14 +950,9 @@ function proceedAfterOcr(ctx, sid) {
   const session = userSessions[sid];
   if (!session) return;
 
-  // 1) Bekannte Stichwort-Liste (sicherste Erkennung)
-  let supplier = matchSupplier(session.extractedText, SUPPLIERS);
-  let guessed = false;
-  // 2) Sonst: Lieferant frei aus dem Beleg-Kopf lesen
-  if (!supplier) {
-    supplier = guessSupplierFromText(session.extractedText);
-    guessed = !!supplier;
-  }
+  // 1) Bekannte Stichwort-Liste (sicherste Erkennung), sonst frei aus dem
+  //    Beleg-Kopf lesen – jeweils über beide OCR-Lesarten.
+  const { supplier, guessed } = findSupplier([session.extractedText, session.extractedTextAlt]);
 
   if (supplier) {
     session.supplier = supplier;
@@ -1415,13 +1512,28 @@ function showReview(ctx, sid) {
   if (!s) return;
 
   // 'fallback' = kein Stichwort gefunden, nur der größte Betrag -> unsicher
-  const totalFlag = s.total === null || s.total === undefined ? ' ⚠️' : s.totalSource === 'fallback' ? ' ⚠️ (unsicher)' : '';
-  const vatFlag = s.vat === null || s.vat === undefined ? ' ⚠️' : '';
+  const totalFlag =
+    s.total === null || s.total === undefined
+      ? ' ⚠️'
+      : s.totalSource === 'fallback'
+        ? ' ⚠️ (unsicher)'
+        : '';
+  // 'computed'/'net-diff' = nicht abgelesen, sondern errechnet
+  const vatFlag =
+    s.vat === null || s.vat === undefined
+      ? ' ⚠️'
+      : vatLooksOff(s.total, s.vat)
+        ? ' ⚠️ (unsicher)'
+        : s.vatSource === 'computed' || s.vatSource === 'net-diff'
+          ? ' (gerechnet)'
+          : '';
 
   const hints = [];
   if (s.totalSource === 'fallback') hints.push('Betrag wurde nur geschätzt – bitte vergleichen.');
+  if (s.total === null || s.total === undefined) hints.push('Kein Betrag gefunden – bitte eintragen.');
   if (vatLooksOff(s.total, s.vat)) hints.push('MwSt passt rechnerisch nicht zum Brutto.');
   if (!s.invoiceDate) hints.push('Kein Datum erkannt – ohne Datum zählt der Beleg im aktuellen Monat.');
+  if (!s.receiptNumber) hints.push('Keine Beleg-Nr. gefunden – der Dateiname endet dann auf „ohneNr".');
 
   const kind = receiptKind(s.paymentMethod);
   const monthKey = s.invoiceDate ? s.invoiceDate.slice(0, 7) : monthKeyOf(new Date());

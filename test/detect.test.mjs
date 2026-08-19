@@ -4,10 +4,12 @@ import {
   detectTotal,
   detectTotalInfo,
   detectVat,
+  detectVatInfo,
   detectReceiptNumber,
   detectDate,
   guessSupplierFromText,
   matchSupplier,
+  supplierKeywords,
   parseAmount,
   amountsOn,
   euro
@@ -443,6 +445,285 @@ IBAN AT12 3456 7890 1234 5678
   assert.equal(detectVat(rg, 1200), 200, 'MwSt');
   assert.equal(detectReceiptNumber(rg), 'RE-2025-88231', 'Rechnungsnummer, nicht Kundennummer');
   assert.equal(detectDate(rg, HEUTE), '2025-09-30', 'Datum');
+});
+
+// ---------- Nachgebesserte Fälle (echte Fehlerbilder aus dem Betrieb) ----------
+
+test('Firmennamen mit "versteckten" Stichwörtern werden erkannt', () => {
+  // Frueher scheiterten diese Namen daran, dass "tel" in Hotel, "atu" in
+  // Naturkost und "ust" in Gusto ohne Wortgrenze gesucht wurden.
+  const faelle = [
+    ['Hotel Sacher Betriebs GmbH\nPhilharmonikerstraße 4\n1010 Wien', 'Hotel Sacher Betriebs GmbH'],
+    ['Naturkost Handels GmbH\nHauptstraße 5', 'Naturkost Handels GmbH'],
+    ['Gusto Feinkost GmbH\nMarktgasse 3', 'Gusto Feinkost GmbH'],
+    ['Statuen Bau GmbH\nRingstraße 1', 'Statuen Bau GmbH']
+  ];
+  for (const [bon, erwartet] of faelle) {
+    assert.equal(guessSupplierFromText(bon), erwartet, `Beleg: "${bon.split('\n')[0]}"`);
+  }
+});
+
+test('Der eigene Betrieb wird nie als Lieferant vorgeschlagen', () => {
+  const rg = `
+Zeytoon Gastronomie GmbH
+Favoritenstraße 1
+1100 Wien
+
+Mega Gastro GmbH
+Handelskai 100
+`;
+  assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'Mega Gastro GmbH');
+  // ohne Ignorier-Liste gewinnt der erste Firmenname
+  assert.equal(guessSupplierFromText(rg), 'Zeytoon Gastronomie GmbH');
+});
+
+test('Ab dem Rechnungsempfänger wird nicht mehr nach dem Lieferanten gesucht', () => {
+  const rg = `
+Metro Cash & Carry GmbH
+Metrostraße 1
+
+Rechnungsempfänger:
+Restaurant Zeytoon GmbH
+`;
+  assert.equal(guessSupplierFromText(rg), 'Metro Cash & Carry GmbH');
+});
+
+test('Stichwörter für neue Lieferanten meiden Allerweltswörter', () => {
+  assert.deepEqual(supplierKeywords('Hotel Sacher GmbH'), ['hotel sacher gmbh', 'sacher', 'hotel sacher']);
+  assert.deepEqual(supplierKeywords('Mega Gastro GmbH'), ['mega gastro gmbh', 'mega', 'mega gastro']);
+  // ohne markantes Wort bleibt nur der volle Name (+ Name ohne Rechtsform)
+  assert.deepEqual(supplierKeywords('Gastro GmbH'), ['gastro gmbh', 'gastro']);
+});
+
+test('Lieferant wird auch bei anderer Schreibweise der OCR gefunden', () => {
+  const suppliers = [
+    { name: 'Mega Gastro GmbH', keywords: ['mega gastro', 'megagastro'] },
+    { name: 'GastroGenius GmbH', keywords: ['gastrogenius'] }
+  ];
+  assert.equal(matchSupplier('MEGA-GASTRO GMBH\nWien', suppliers), 'Mega Gastro GmbH');
+  assert.equal(matchSupplier('Gastro Genius GmbH\nWien', suppliers), 'GastroGenius GmbH');
+});
+
+test('Zweispaltiger Beleg: Bezeichnungen und Beträge stehen als zwei Blöcke', () => {
+  // So liefert die OCR breite Belege sehr oft: erst die Spalte links,
+  // dann die Spalte rechts. Ohne Zusammenführung landet der falsche Wert.
+  const bon = `
+Metro Wien
+Zwischensumme
+Rabatt
+Zu zahlen
+50,00
+5,00
+45,00
+`;
+  assert.equal(detectTotal(bon), 45);
+});
+
+test('Kartenzahlung ohne Summen-Stichwort ergibt den Endbetrag', () => {
+  const bon = `
+JET Tankstelle
+Diesel 30,00 L
+Kartenzahlung          52,80
+Maestro **** 1234
+`;
+  const info = detectTotalInfo(bon);
+  assert.equal(info.value, 52.8);
+  assert.equal(info.source, 'payment');
+});
+
+test('Österreichische Kurzschreibweise "24,-" wird als Betrag gelesen', () => {
+  assert.equal(parseAmount('24,-'), 24);
+  assert.deepEqual(amountsOn('Summe 24,--'), [24]);
+  assert.equal(detectTotal('Kebap 8,-\nSumme 24,-'), 24);
+});
+
+test('OCR-Leerzeichen im Betrag ("24, 90") wird verkraftet', () => {
+  assert.deepEqual(amountsOn('Gesamtbetrag 1.234, 56'), [1234.56]);
+  assert.equal(detectTotal('Zu zahlen 44, 90'), 44.9);
+});
+
+test('Betrag in EUR-Schreibweise in der Folgezeile', () => {
+  assert.equal(detectTotal('Gesamtbetrag\nEUR 1.200,00'), 1200);
+  assert.equal(detectTotal('Zu zahlen\n44,90 EUR'), 44.9);
+});
+
+test('MwSt aus Brutto minus Netto, wenn kein Steuerbetrag ausgewiesen ist', () => {
+  const rg = `
+Nettobetrag        100,00
+Rechnungsbetrag    120,00
+`;
+  const info = detectVatInfo(rg, 120);
+  assert.equal(info.value, 20);
+  assert.equal(info.source, 'net-diff');
+  // unpassende Differenz (kein gültiger Steuersatz) wird NICHT übernommen
+  assert.equal(detectVat('Nettobetrag 100,00\nRechnungsbetrag 105,00', 105), null);
+});
+
+test('MwSt-Summenzeile gewinnt gegen doppelt gezählte Einzelzeilen', () => {
+  const rg = `
+Gesamtbetrag          120,00
+MwSt 20%               20,00
+Summe inkl. MwSt      120,00
+`;
+  assert.equal(detectVat(rg, 120), 20);
+});
+
+test('MwSt steht in der Zeile unter dem Stichwort', () => {
+  const rg = `
+Gesamt 120,00
+MwSt 20%
+20,00
+`;
+  assert.equal(detectVat(rg, 120), 20);
+});
+
+test('Belegnummer: weitere Schreibweisen aus der Praxis', () => {
+  const faelle = [
+    ['Beleg-ID: 4711-2025', '4711-2025'],
+    ['Rechnung Nr. 7', '7'],
+    ['Kassenrechnung Nr 8812', '8812'],
+    ['Registrierbeleg 000123', '000123'],
+    ['Rechnungs-Nr\n2025/0042', '2025/0042'],
+    ['Mega Gastro GmbH\n2025/0042\nSumme 44,90', '2025/0042']
+  ];
+  for (const [zeile, erwartet] of faelle) {
+    assert.equal(detectReceiptNumber(zeile), erwartet, `Zeile: "${zeile}"`);
+  }
+});
+
+test('Telefonnummern bleiben auch ohne Label keine Belegnummer', () => {
+  assert.equal(detectReceiptNumber('Mega Gastro GmbH\n01 234 56-78\nSumme 44,90'), null);
+  assert.equal(detectReceiptNumber('Mega Gastro\nTel 0664 123-4567'), null);
+});
+
+// ---------- Ganze Belege, wie sie im Betrieb ankommen ----------
+
+const BEKANNTE = [
+  { name: 'Metro 1110', keywords: ['metro'] },
+  { name: 'Hofer', keywords: ['hofer'] },
+  { name: 'JET Tankstelle', keywords: ['jet tankstelle', 'jet '] }
+];
+
+// Prüft alle Felder eines Belegs auf einmal.
+function pruefe(bon, erwartet) {
+  const total = detectTotalInfo(bon);
+  const vat = detectVatInfo(bon, total.value);
+  const lieferant = matchSupplier(bon, BEKANNTE) || guessSupplierFromText(bon, ['zeytoon']);
+  assert.equal(lieferant, erwartet.lieferant, 'Lieferant');
+  assert.equal(total.value, erwartet.brutto, 'Brutto');
+  assert.equal(vat.value, erwartet.mwst, 'MwSt');
+  assert.equal(detectDate(bon, HEUTE), erwartet.datum, 'Datum');
+  assert.equal(detectReceiptNumber(bon), erwartet.nummer, 'Beleg-Nr.');
+}
+
+test('Supermarkt-Kassabon mit Bankomatzahlung', () => {
+  pruefe(
+    `
+HOFER KG
+Filiale 0412
+Triester Straße 20
+1100 WIEN
+Tel. 0800 400 400
+
+Milch 1L            1,29 A
+Brot                2,49 A
+Käse                4,99 A
+--------------------------
+SUMME EUR           8,77
+Bankomat            8,77
+
+A = 10% MwSt   Netto 7,97   MwSt 0,80
+Beleg-Nr. 0412-2025-08812
+03.10.2025 18:22
+`,
+    { lieferant: 'Hofer', brutto: 8.77, mwst: 0.8, datum: '2025-10-03', nummer: '0412-2025-08812' }
+  );
+});
+
+test('A4-Eingangsrechnung mit Empfängerblock', () => {
+  pruefe(
+    `
+METRO Cash & Carry Österreich GmbH
+Metrostraße 1
+1110 Wien
+UID: ATU40616605
+
+RECHNUNG
+
+Rechnungsempfänger:
+Restaurant Zeytoon
+Favoritenstraße 1
+
+Rechnungsnummer      RE-2025-88231
+Rechnungsdatum       30.09.2025
+Kundennummer         4455667
+
+Warenwert netto          1.000,00
+20 % MwSt                  200,00
+Rechnungsbetrag          1.200,00
+
+Zahlbar bis 14.10.2025
+IBAN AT12 3456 7890 1234 5678
+`,
+    { lieferant: 'Metro 1110', brutto: 1200, mwst: 200, datum: '2025-09-30', nummer: 'RE-2025-88231' }
+  );
+});
+
+test('Kassabon, dessen Spalten die OCR getrennt hat', () => {
+  pruefe(
+    `
+Naturkost Handels GmbH
+Hauptstraße 5
+1010 Wien
+Bon-Nr 88231
+Zwischensumme
+Rabatt
+Zu zahlen
+Gegeben
+Rückgeld
+34,00
+4,00
+30,00
+50,00
+20,00
+`,
+    { lieferant: 'Naturkost Handels GmbH', brutto: 30, mwst: null, datum: null, nummer: '88231' }
+  );
+});
+
+test('Tankstellen-Beleg ganz ohne Summen-Stichwort', () => {
+  pruefe(
+    `
+JET Tankstelle Wien Süd
+Triester Str. 100
+Diesel      30,12 L
+Preis/L      1,759
+Kartenzahlung        52,98
+Maestro **** 1234
+Beleg 0099123
+04.10.2025 07:14
+`,
+    { lieferant: 'JET Tankstelle', brutto: 52.98, mwst: null, datum: '2025-10-04', nummer: '0099123' }
+  );
+});
+
+test('Kleiner Wirt mit Kurzschreibweise "8,-"', () => {
+  pruefe(
+    `
+Gasthaus Zum Gusto
+Inh. Alizadeh
+Kebap                8,-
+Cola                 3,-
+------------------
+Summe               11,-
+Bar                 20,-
+Retour               9,-
+Bon 42
+inkl. 10% MwSt
+05.10.2025
+`,
+    { lieferant: 'Gasthaus Zum Gusto', brutto: 11, mwst: 1, datum: '2025-10-05', nummer: '42' }
+  );
 });
 
 test('Bekannter Lieferant im Kopf schlägt Nennung im Fließtext', () => {
