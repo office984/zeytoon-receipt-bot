@@ -1865,11 +1865,11 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-08-14-detection-rework',
+    version: '2026-08-19-detection-v3',
     features: [
-      'ocr', 'crop', 'multipage', 'viva',
-      'receiptNr-v2', 'vat-v2', 'total-cashcheck', 'date-v2',
-      'supplier-search', 'dup-check', 'kassen-eingangsrechnung'
+      'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
+      'receiptNr-v3', 'vat-v3', 'total-columns', 'total-payment-line', 'date-v2',
+      'supplier-v3', 'supplier-search', 'dup-check', 'kassen-eingangsrechnung'
     ],
     firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt',
     suppliers: SUPPLIERS.length,
