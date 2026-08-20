@@ -200,6 +200,49 @@ function toLabelLines(text) {
   return mergeLabelBlocks(toLines(text));
 }
 
+// ---------- Gegenproben für Betrag und MwSt ----------
+
+// In Österreich gültige Steuersätze (0/10/13/20 %) – ein daraus errechnetes
+// Verhältnis MwSt/Brutto ist ein starkes Indiz dafür, dass der Wert stimmt.
+const AT_RATIOS = [10 / 110, 13 / 113, 20 / 120];
+function ratioLooksLikeVat(total, vat) {
+  if (!total || !vat) return false;
+  return AT_RATIOS.some((r) => Math.abs(vat / total - r) < 0.012);
+}
+
+/**
+ * Dreiergruppe Netto / Steuer / Brutto als eigenständiger Zahlenblock:
+ *
+ *   139,80   <- netto
+ *   27,96    <- USt.
+ *   167,76   <- brutto
+ *
+ * Das kommt vor, wenn die OCR die Bezeichnungen ganz woanders hinschreibt als
+ * die Werte – auf der ILLE-Rechnung stehen "Total EUR ohne/inkl. MwSt." mitten
+ * im Beleg, die drei Zahlen dazu ganz am Ende. Ohne diese Regel bleibt für den
+ * Betrag nur "größte Zahl raten".
+ *
+ * Übernommen wird eine Gruppe nur bei DOPPELTER Gegenprobe: netto + steuer =
+ * brutto UND steuer/brutto ist ein gültiger österreichischer Steuersatz.
+ * Zufallstreffer sind damit praktisch ausgeschlossen.
+ */
+function netVatGrossTriple(lines) {
+  for (let i = 0; i + 2 < lines.length; i++) {
+    // Genau drei reine Betragszeilen – davor und danach darf keine mehr stehen,
+    // sonst ist es eine Betragsspalte und keine Zusammenfassung.
+    if (i > 0 && isMoneyLine(lines[i - 1])) continue;
+    if (!isMoneyLine(lines[i]) || !isMoneyLine(lines[i + 1]) || !isMoneyLine(lines[i + 2])) continue;
+    if (i + 3 < lines.length && isMoneyLine(lines[i + 3])) continue;
+    const v = [lines[i], lines[i + 1], lines[i + 2]].map((l) => amountsOn(l)[0]);
+    if (v.some((x) => typeof x !== 'number' || isNaN(x) || x <= 0)) continue;
+    const [net, vat, gross] = v;
+    if (Math.abs(net + vat - gross) > 0.02) continue;
+    if (!ratioLooksLikeVat(gross, vat)) continue;
+    return { net, vat, gross };
+  }
+  return null;
+}
+
 // ---------- Brutto-/Endbetrag ----------
 
 // Stichwörter für den Endbetrag, nach Priorität
@@ -315,7 +358,12 @@ export function detectTotalInfo(text) {
   }
   if (payCands.length) return { value: Math.max(...payCands), source: 'payment' };
 
-  // 5) Notfall: größter Betrag – Bargeld-/Steuerzeilen aber ausgenommen
+  // 5) Kein Stichwort am Betrag, aber ein Netto/Steuer/Brutto-Block im Beleg.
+  //    Das ist immer noch belegt gerechnet und damit weit besser als Raten.
+  const triple = netVatGrossTriple(lines);
+  if (triple) return { value: triple.gross, source: 'net-vat-gross' };
+
+  // 6) Notfall: größter Betrag – Bargeld-/Steuerzeilen aber ausgenommen
   let max = null;
   for (const line of lines) {
     if (TOTAL_SKIP.test(line) || VAT_LINE.test(line)) continue;
@@ -349,14 +397,6 @@ const VAT_KEY_SKIP = /(steuer\s*-?\s*nr|st\.?\s?-?\s?nr|\buid\b|\batu\b|finanzam
 
 // Netto-Zeilen: aus Brutto − Netto lässt sich die MwSt notfalls ableiten
 const NET_LINE_RE = /(nettobetrag|netto\s*summe|summe\s*netto|gesamt\s*netto|warenwert|\bnetto\b|\bexkl\.?\s*(mwst|ust)|zwischensumme\s*netto)/i;
-
-// In Österreich gültige Steuersätze (0/10/13/20 %) – ein daraus errechnetes
-// Verhältnis MwSt/Brutto ist ein starkes Indiz dafür, dass der Wert stimmt.
-const AT_RATIOS = [10 / 110, 13 / 113, 20 / 120];
-function ratioLooksLikeVat(total, vat) {
-  if (!total || !vat) return false;
-  return AT_RATIOS.some((r) => Math.abs(vat / total - r) < 0.012);
-}
 
 /**
  * Bezahlte MwSt aus dem OCR-Text lesen.
@@ -408,6 +448,14 @@ export function detectVatInfo(text, total = null) {
       if (Math.abs(rest[0] + rest[1] - total) > 0.02) continue;
       const v = Math.min(...rest);
       if (v > 0 && plausible(v)) return { value: v, source: 'summary-triple' };
+    }
+  }
+
+  // 1c) Dieselbe Dreiergruppe ohne Stichwort davor (siehe netVatGrossTriple).
+  if (total) {
+    const triple = netVatGrossTriple(lines);
+    if (triple && Math.abs(triple.gross - total) <= 0.02 && plausible(triple.vat)) {
+      return { value: triple.vat, source: 'net-vat-gross' };
     }
   }
 
@@ -989,6 +1037,31 @@ const FOOTER_SENDER_RE = /^([^,]{3,60}),\s*(.+)$/;
  * sicher, dass das Komma Name und Adresse trennt und nicht Teil des Namens ist
  * ("Müller, Meier & Co GmbH").
  */
+// "1230 Wien" / "A-1211 Wien" – PLZ-Zeile mit Ortsnamen
+const PLZ_CITY_RE = /^\s*(?:A[-\s])?\d{4,5}\s+\p{L}/u;
+
+/**
+ * Absenderblock über drei Zeilen – dieselbe Impressum-Angabe wie
+ * senderFromCommaLine, nur ohne Kommas:
+ *
+ *   ILLE PAPIER-SERVICE GMBH
+ *   Birostraße 11
+ *   1230 Wien
+ *
+ * Verlangt werden alle drei Teile (Rechtsform, Straße, PLZ + Ort). Eine
+ * einzelne Zeile mit "GmbH" irgendwo im Fließtext reicht bewusst NICHT.
+ */
+function senderFromBlock(lines, i) {
+  const firma = String(lines[i] || '').trim();
+  if (!LEGAL_FORM_RE.test(firma) || ADDRESS_RE.test(firma)) return null;
+  const strasse = lines[i + 1];
+  const plz = lines[i + 2];
+  if (!strasse || !plz) return null;
+  if (!ADDRESS_RE.test(strasse) || PLZ_CITY_RE.test(strasse)) return null;
+  if (!PLZ_CITY_RE.test(plz)) return null;
+  return firma;
+}
+
 function senderFromCommaLine(line) {
   const m = String(line || '').match(FOOTER_SENDER_RE);
   if (!m) return null;
@@ -1072,13 +1145,14 @@ export function guessSupplierFromText(text, ignore = []) {
 
   // 2) Absender in der Impressum-/Fußzeile:
   //    "Hutchison Drei Austria GmbH, Brünner Straße 52, 1210 Wien, Österreich"
+  //    oder als Block: Firmenzeile / Straßenzeile / PLZ-Ort-Zeile.
   //    Große Rechnungssteller (Telekom, Energie, Versicherung) setzen ihren
   //    Namen NICHT in den Briefkopf – oben steht nur die Empfängeradresse.
   //    Ohne diese Stufe wird der Empfänger als Lieferant verbucht.
   //    Bewusst VOR Stufe 3: eine Zeile "Firma GmbH, Straße, PLZ Ort" ist ein
   //    viel stärkeres Indiz als "erste Zeile, die nach Text aussieht".
-  for (const line of all) {
-    const firma = senderFromCommaLine(line);
+  for (let i = 0; i < all.length; i++) {
+    const firma = senderFromCommaLine(all[i]) || senderFromBlock(all, i);
     if (!firma || !usable(firma)) continue;
     const name = cleanSupplierName(firma);
     if (name.length >= 3 && name.length <= 60) return name;

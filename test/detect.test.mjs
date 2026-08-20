@@ -1091,3 +1091,88 @@ Datum
 `;
   assert.equal(detectReceiptNumber(rg), '4711');
 });
+// ---------- ILLE-Rechnung (Fehlerbeleg 20.08.2026) ----------
+// Logo statt Briefkopf ("lle"), Absender nur im Fuss ohne Kommas, und die drei
+// Summenwerte stehen ganz am Ende - weit weg von ihren Bezeichnungen.
+const ILLE = `lle
+WWW.ILLE.EU
+Zeytoon GmbH
+Restaurant Toranj
+Ungargasse 6/3
+1030 Wien
+RECHNUNG (SV)
+Beleg Nr.
+Datum
+Kundennr.
+Objektnr.
+Seite
+SR26203765
+18.08.2026
+315426
+0315426
+1
+100720 Clean Attack Fresh elektrisch black Duft-Spender
+12,47
+2
+24,94
+Total EUR ohne MwSt.
+20% MwSt.
+Total EUR inkl. MwSt.
+Ausgabe
+Menge
+Zahlungsbedingungen
+8 Tage nach Rechnungsdatum
+Zeytoon GmbH, Restaurant Toranj, Hasan Sarabi, Ungargasse 6/3, 1030 Wien
+ILLE PAPIER-SERVICE GMBH
+Birostraße 11
+1230 Wien
+GESCHÄFTSFÜHRER
+Daniel Kofler
+HG WIEN FN168348x
+UID ATU44474403 DVR 0953229
+TELEFON +43 (0) 1 6883015
+E-MAIL info@illepapier.at
+139,80
+27,96
+167,76
+`;
+const ILLE_HEUTE = new Date('2026-08-20T12:00:00Z');
+
+test('ILLE: Absender steht als Block im Fuss, oben nur das Logo', () => {
+  // Frueher kam "lle" heraus - die OCR verschluckt das I im Logo.
+  assert.equal(guessSupplierFromText(ILLE, ['zeytoon']), 'ILLE PAPIER-SERVICE GMBH');
+});
+
+test('ILLE: Betrag aus dem Netto/Steuer/Brutto-Block statt geraten', () => {
+  const total = detectTotalInfo(ILLE);
+  assert.equal(total.value, 167.76);
+  assert.equal(total.source, 'net-vat-gross', 'nicht mehr "fallback"');
+  const vat = detectVatInfo(ILLE, total.value);
+  assert.equal(vat.value, 27.96);
+});
+
+test('ILLE: achtspaltiger Kopf liefert Belegnummer und Datum', () => {
+  assert.equal(detectReceiptNumber(ILLE), 'SR26203765');
+  assert.equal(detectDate(ILLE, ILLE_HEUTE), '2026-08-18');
+});
+
+test('Dreiergruppe ohne gueltigen Steuersatz wird nicht als Summe genommen', () => {
+  // 14,68 + 139,80 ist nicht 139,80 - so eine Betragsspalte darf nicht zaehlen
+  const bon = `Artikel
+14,68
+139,80
+139,80
+Zu zahlen 200,00
+`;
+  assert.equal(detectTotalInfo(bon).value, 200);
+});
+
+test('Empfaengeradresse mit Rechtsform im Fuss gilt nicht als Lieferant', () => {
+  const rg = `Rechnung
+Zeytoon GmbH, Ungargasse 6/3, 1030 Wien
+Musterhandel GmbH
+Hauptstraße 1
+1010 Wien
+`;
+  assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'Musterhandel GmbH');
+});
