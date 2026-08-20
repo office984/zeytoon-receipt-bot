@@ -1844,7 +1844,7 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-08-19-detection-v5',
+    version: '2026-08-20-detection-v6',
     features: [
       'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
       'receiptNr-v3', 'vat-v5', 'vat-multiline-rates', 'vat-repeated-rates',

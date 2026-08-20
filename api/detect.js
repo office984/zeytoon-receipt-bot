@@ -147,6 +147,59 @@ function toAmountLines(text) {
   return mergeColumnBlocks(toLines(text));
 }
 
+/**
+ * Wie mergeColumnBlocks, nur für BELIEBIGE Werte (Nummern, Datum) statt Beträge.
+ * Rechnungen großer Firmen setzen den Kopf zweispaltig, die OCR liest ihn aber
+ * spaltenweise – erst alle Bezeichnungen, dann alle Werte:
+ *
+ *   Kundennummer                     Kundennummer    9355395295
+ *   Rechnungsnummer          ->      Rechnungsnummer 6323799204
+ *   Rechnungsdatum                   Rechnungsdatum  17. Aug. 2026
+ *   9355395295
+ *   6323799204
+ *   17. Aug. 2026
+ *
+ * Ohne das erwischt "Rechnungsnummer" den Wert der Zeile DARÜBER (also die
+ * Kundennummer) und "Rechnungsdatum" gar keinen – genau so ist eine
+ * Drei-Rechnung mit falscher Nummer und falschem Datum verbucht worden.
+ */
+// Reine Bezeichnung: nur Buchstaben (keine Ziffern), kurz, höchstens drei Wörter
+const LABEL_ONLY_RE = /^\p{L}[\p{L}\s./&()-]{2,29}:?$/u;
+// Wert dazu: kurz und mit mindestens einer Ziffer ("6323799204", "17. Aug. 2026")
+function isLabelLine(l) {
+  return LABEL_ONLY_RE.test(l) && l.split(/\s+/).length <= 3;
+}
+function isValueLine(l) {
+  return /\d/.test(l) && l.length <= 25 && l.split(/\s+/).length <= 3;
+}
+
+function mergeLabelBlocks(lines) {
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    let a = i;
+    while (a < lines.length && isLabelLine(lines[a])) a++;
+    let b = a;
+    while (b < lines.length && isValueLine(lines[b])) b++;
+
+    const labels = a - i;
+    const values = b - a;
+    if (labels >= 2 && labels === values) {
+      for (let k = 0; k < labels; k++) out.push(`${lines[i + k]} ${lines[a + k]}`);
+      i = b;
+      continue;
+    }
+    out.push(lines[i]);
+    i++;
+  }
+  return out;
+}
+
+// Zeilen für Belegnummer/Datum (inkl. Spalten-Reparatur für Bezeichnung+Wert)
+function toLabelLines(text) {
+  return mergeLabelBlocks(toLines(text));
+}
+
 // ---------- Brutto-/Endbetrag ----------
 
 // Stichwörter für den Endbetrag, nach Priorität
@@ -327,6 +380,35 @@ export function detectVatInfo(text, total = null) {
     if (!a.length) continue;
     const v = a.length === 1 ? a[0] : Math.min(...a);
     if (plausible(v)) return { value: v, source: 'sum' };
+  }
+
+  // 1b) Summenzeile mit der Dreiergruppe Netto / Steuer / Brutto:
+  //
+  //   Rechnungsbetrag
+  //   103,56 €    <- netto
+  //   18,71 €     <- USt.
+  //   122,27 €    <- brutto
+  //
+  // Die Gegenprobe netto + steuer = brutto = erkanntes Brutto macht das
+  // eindeutig, deshalb steht sie VOR der Auswertung der Steuersatz-Zeilen:
+  // auf mehrseitigen Rechnungen sind die Einzelblöcke oft so verschachtelt,
+  // dass ein Steuerbetrag untergeht (Drei: 13,03 statt 18,71 zusammengezählt).
+  if (total) {
+    for (let i = 0; i < lines.length; i++) {
+      if (!STRONG_TOTAL.test(lines[i]) || VAT_KEY_SKIP.test(lines[i])) continue;
+      const vals = amountsOn(lines[i]);
+      for (let k = i + 1; k < Math.min(i + 5, lines.length) && vals.length < 3; k++) {
+        if (!isMoneyLine(lines[k])) break;
+        vals.push(...amountsOn(lines[k]));
+      }
+      if (vals.length !== 3) continue;
+      const gi = vals.findIndex((v) => Math.abs(v - total) <= 0.02);
+      if (gi < 0) continue;
+      const rest = vals.filter((_, idx) => idx !== gi);
+      if (Math.abs(rest[0] + rest[1] - total) > 0.02) continue;
+      const v = Math.min(...rest);
+      if (v > 0 && plausible(v)) return { value: v, source: 'summary-triple' };
+    }
   }
 
   // 2) Steuersatz-Zeilen rechnerisch auflösen:
@@ -671,7 +753,7 @@ const RN_SPLITNUM_RE = /^[^\dA-Za-z]*(\d{3,6}\s?[-/]\s?\d{2,6}|\d{2,6}\s?[-/]\s?
  * übernommen, der zu einem eindeutigen Label oder einem klaren Muster gehört.
  */
 export function detectReceiptNumber(text) {
-  const lines = toLines(text);
+  const lines = toLabelLines(text);
   if (!lines.length) return null;
 
   // Label und Wert stehen in zwei Spalten -> Wert in einer der nächsten Zeilen.
@@ -827,7 +909,7 @@ const DATE_PATTERNS = [
  * @param {number} maxAgeDays wie weit darf das Datum zurückliegen (Standard 3 Jahre)
  */
 export function detectDate(text, today = new Date(), maxAgeDays = 3 * 365) {
-  const lines = toLines(text);
+  const lines = toLabelLines(text);
   if (!lines.length) return null;
 
   const dateOn = (line) => {
@@ -880,6 +962,9 @@ const HEADER_NOISE_RE = new RegExp(
     '\\bgesamt', '\\bmwst', '\\bu\\.?\\s?st\\.?\\b', '\\bnetto\\b', '\\bbrutto\\b',
     '\\bdanke', '\\bwillkommen\\b', '\\bbediener\\b', '\\bkellner\\b', '\\btisch\\b',
     '\\bnr\\.?\\b', '\\bstk\\b', '\\bmenge\\b', '\\bartikel', '\\bpreis\\b',
+    // Anrede = Ansprechpartner beim EMPFÄNGER, nie der Lieferant.
+    // Nur mit Leerzeichen dahinter, sonst fiele "Herrmann GmbH" mit heraus.
+    '^\\s*(herr|frau|hr|fr)\\.?\\s', '\\bz\\.?\\s?hd?\\.',
     // "Bar" nur als ganze Zeile ausschließen – "Bar Milano" wäre ein Lieferant
     '\\bzahlung', '^\\s*bar\\s*$', '\\bbarzahlung\\b', '\\bkarte\\b',
     'ffnungszeit', 'gesch(ä|ae)ftszeit'
@@ -893,6 +978,26 @@ const RECIPIENT_RE =
 
 const ADDRESS_RE = /(stra(ss|ß)e\b|\bstr\.|\w*gasse\b|\bplatz\b|\bweg\b|\bring\b|\ballee\b|\bpostfach\b|\b\d{4,5}\b)/i;
 const DATE_LINE_RE = /\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b/;
+
+// "Firma GmbH, Straße 1, 1210 Wien" – Absenderzeile im Impressum-Fuß
+const FOOTER_SENDER_RE = /^([^,]{3,60}),\s*(.+)$/;
+
+/**
+ * Firmenname aus einer Zeile "Firma GmbH, Straße 1, 1210 Wien".
+ * Vorne muss die Rechtsform stehen und darf KEINE Adresse sein, hinten muss
+ * eine echte Anschrift folgen (Straße/Gasse/... UND eine PLZ). Nur so ist
+ * sicher, dass das Komma Name und Adresse trennt und nicht Teil des Namens ist
+ * ("Müller, Meier & Co GmbH").
+ */
+function senderFromCommaLine(line) {
+  const m = String(line || '').match(FOOTER_SENDER_RE);
+  if (!m) return null;
+  const firma = m[1].trim();
+  const anschrift = m[2];
+  if (!LEGAL_FORM_RE.test(firma) || ADDRESS_RE.test(firma)) return null;
+  if (!ADDRESS_RE.test(anschrift) || !/\b\d{4,5}\b/.test(anschrift)) return null;
+  return firma;
+}
 
 function cleanSupplierName(line) {
   return (line || '')
@@ -960,18 +1065,33 @@ export function guessSupplierFromText(text, ignore = []) {
     // Adresszeilen mit Rechtsform gibt es praktisch nicht – aber "1020 Wien AG"
     // wäre eine; PLZ-Zeilen daher trotzdem aussortieren.
     if (/^\s*\d{4,5}\b/.test(line)) continue;
-    const name = cleanSupplierName(line);
+    // "Musterhandel GmbH, Hauptstraße 1, 1010 Wien" -> nur der Firmenteil
+    const name = cleanSupplierName(senderFromCommaLine(line) || line);
     if (name.length >= 3 && name.length <= 60) return name;
   }
 
-  // 2) Sonst: erste „firmen-artige" Zeile (ohne Adresse)
+  // 2) Absender in der Impressum-/Fußzeile:
+  //    "Hutchison Drei Austria GmbH, Brünner Straße 52, 1210 Wien, Österreich"
+  //    Große Rechnungssteller (Telekom, Energie, Versicherung) setzen ihren
+  //    Namen NICHT in den Briefkopf – oben steht nur die Empfängeradresse.
+  //    Ohne diese Stufe wird der Empfänger als Lieferant verbucht.
+  //    Bewusst VOR Stufe 3: eine Zeile "Firma GmbH, Straße, PLZ Ort" ist ein
+  //    viel stärkeres Indiz als "erste Zeile, die nach Text aussieht".
+  for (const line of all) {
+    const firma = senderFromCommaLine(line);
+    if (!firma || !usable(firma)) continue;
+    const name = cleanSupplierName(firma);
+    if (name.length >= 3 && name.length <= 60) return name;
+  }
+
+  // 3) Sonst: erste „firmen-artige" Zeile (ohne Adresse)
   for (const line of header) {
     if (!usable(line) || ADDRESS_RE.test(line)) continue;
     const name = cleanSupplierName(line);
     if (name.length >= 3 && name.length <= 60) return name;
   }
 
-  // 3) Notnagel: irgendwo im Text eine Zeile mit Rechtsform
+  // 4) Notnagel: irgendwo im Text eine Zeile mit Rechtsform
   for (const line of all.slice(0, 40)) {
     if (!LEGAL_FORM_RE.test(line) || !usable(line) || ADDRESS_RE.test(line)) continue;
     const name = cleanSupplierName(line);

@@ -1005,3 +1005,89 @@ Artikel: Metro Reiniger 3,99
 `;
   assert.equal(matchSupplier(bon, suppliers), 'Spar');
 });
+// ---------- Drei-Rechnung (Fehlerbeleg 20.08.2026) ----------
+// Zweispaltiger Kopf, Absender nur im Fuß, MwSt nur in der Summenzeile sauber.
+// Der Bot hatte hier den Empfänger als Lieferant, die Kundennummer als
+// Belegnummer, das Mahnspesen-Datum als Rechnungsdatum und 13,03 statt 18,71.
+const DREI = `Kundennummer
+Rechnungsnummer
+Rechnungsdatum
+9355395295
+6323799204
+17. Aug. 2026
+Zeytoon GmbH
+Herr Hassan Sarabi
+Ungargasse 6/1
+1030 Wien
+Gesamt offener Saldo
+122,27 €
+Rechnungsübersicht
+netto
+USt.%
+USt.
+brutto
+019978097
+12,50 € 20%
+28,41 € 20%
+0,00 €
+2,50 €
+15,00 €
+5,68 €
+34,10 €
+Mahnspesen für Zahlungserinnerung vom 03.08.2026
+10,00 €
+0%
+0,00 €
+10,00 €
+Rechnungsbetrag
+103,56 €
+18,71 €
+122,27 €
+Hutchison Drei Austria GmbH, Brünner Straße 52, 1210 Wien, Österreich
+Drei BusinessService: 0660 30 30 80, Fax: 0660 30 30 81, Postfach 333, A-1211 Wien
+Handelsgericht Wien, FN 140132b, UID ATU 41029105
+Bankverbindung Erste Bank, Empfänger: Hutchison Drei Austria GmbH, IBAN: AT452010040312352502
+`;
+const DREI_HEUTE = new Date('2026-08-20T12:00:00Z');
+
+test('Drei: zweispaltiger Kopf – Rechnungsnummer statt Kundennummer', () => {
+  assert.equal(detectReceiptNumber(DREI), '6323799204');
+});
+
+test('Drei: zweispaltiger Kopf – Rechnungsdatum statt Mahnspesen-Datum', () => {
+  assert.equal(detectDate(DREI, DREI_HEUTE), '2026-08-17');
+});
+
+test('Drei: Absender steht nur in der Fußzeile, oben der Empfänger', () => {
+  assert.equal(guessSupplierFromText(DREI, ['zeytoon']), 'Hutchison Drei Austria GmbH');
+});
+
+test('Drei: MwSt aus der Summenzeile netto/USt./brutto', () => {
+  const total = detectTotalInfo(DREI);
+  assert.equal(total.value, 122.27);
+  const vat = detectVatInfo(DREI, total.value);
+  // Nicht 13,03: die verschachtelten Positionsblöcke lassen einen 20%-Satz aus.
+  assert.equal(vat.value, 18.71);
+  assert.equal(vat.source, 'summary-triple');
+});
+
+test('Anrede-Zeilen sind nie der Lieferantenname', () => {
+  const rg = `Rechnung
+Zeytoon GmbH
+Herr Hassan Sarabi
+Ungargasse 6/1
+Musterhandel GmbH, Hauptstraße 1, 1010 Wien
+`;
+  assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'Musterhandel GmbH');
+});
+
+test('Spalten-Zusammenführung greift nur bei gleich langen Bloecken', () => {
+  // Zwei Bezeichnungen, drei Werte -> nichts zusammenfuehren, sonst verrutscht alles
+  const rg = `Belegnummer
+Datum
+4711
+0815
+1234
+`;
+  assert.equal(detectReceiptNumber(rg), '4711');
+});
