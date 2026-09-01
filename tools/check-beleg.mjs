@@ -13,6 +13,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import {
   detectTotalInfo, detectVatInfo, detectReceiptNumber, detectDate,
+  detectAmazonInvoice, stripAmazonPaymentNotes,
   guessSupplierFromText, matchSupplier, euro
 } from '../api/detect.js';
 import { BASE_SUPPLIERS } from '../api/suppliers.js';
@@ -90,15 +91,30 @@ for (const datei of dateien) {
     console.log('--- Ende ---\n');
   }
 
-  const total = detectTotalInfo(text);
-  const vat = detectVatInfo(text, total.value);
-  const bekannt = matchSupplier(text, BASE_SUPPLIERS);
+  // gleiche Reihenfolge wie im Bot (siehe extractFrom/findSupplier in api/index.js)
+  const amazon = detectAmazonInvoice(text);
+  const ohneHinweis = stripAmazonPaymentNotes(text);
+  const bekannt = amazon ? 'Amazon' : matchSupplier(ohneHinweis, BASE_SUPPLIERS);
 
-  console.log(`  Lieferant : ${bekannt || guessSupplierFromText(text, OWN) || '— NICHT ERKANNT —'}` +
+  let total, vat, datum, nummer;
+  if (amazon && amazon.total !== null) {
+    total = { value: amazon.total, source: 'amazon' };
+    vat = amazon.vat !== null ? { value: amazon.vat, source: 'amazon' } : detectVatInfo(text, amazon.total);
+    datum = amazon.date;
+    nummer = amazon.number;
+  } else {
+    total = detectTotalInfo(text);
+    vat = detectVatInfo(text, total.value);
+    datum = detectDate(text);
+    nummer = (amazon && amazon.number) || detectReceiptNumber(text);
+  }
+
+  console.log(`  Lieferant : ${bekannt || guessSupplierFromText(ohneHinweis, OWN) || '— NICHT ERKANNT —'}` +
     `  ${bekannt ? '(aus Liste)' : '(frei gelesen)'}`);
   console.log(`  Brutto    : ${total.value === null ? '— NICHT ERKANNT —' : euro(total.value)}  [${total.source}]`);
   console.log(`  MwSt      : ${vat.value === null ? '— NICHT ERKANNT —' : euro(vat.value)}  [${vat.source}]`);
-  console.log(`  Datum     : ${detectDate(text) || '— NICHT ERKANNT —'}`);
-  console.log(`  Beleg-Nr. : ${detectReceiptNumber(text) || '— NICHT ERKANNT —'}`);
+  console.log(`  Datum     : ${datum || '— NICHT ERKANNT —'}`);
+  console.log(`  Beleg-Nr. : ${nummer || '— NICHT ERKANNT —'}`);
+  if (amazon && amazon.count > 1) console.log(`  Hinweis   : ${amazon.count} Rechnungen in einem PDF (Betrag = Summe)`);
   if (!zeigeText) console.log('  (Rohtext mit --text anzeigen)');
 }

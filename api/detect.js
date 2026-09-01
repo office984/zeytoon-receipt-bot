@@ -166,11 +166,18 @@ function toAmountLines(text) {
 // Reine Bezeichnung: nur Buchstaben (keine Ziffern), kurz, höchstens drei Wörter
 const LABEL_ONLY_RE = /^\p{L}[\p{L}\s./&()-]{2,29}:?$/u;
 // Wert dazu: kurz und mit mindestens einer Ziffer ("6323799204", "17. Aug. 2026")
+// Alleinstehende Belegüberschrift (auch "RECHNUNG (SV)") – die gehört zu keinem
+// Wert. Mit Doppelpunkt ("Rechnung:") ist es dagegen sehr wohl ein Kopffeld.
+const DOC_TITLE_RE =
+  /^(rechnung|rechnungen|beleg|quittung|kassabon|kassenbon|faktura|invoice|receipt|lieferschein|gutschrift)(\s*\(.{1,8}\))?$/i;
 function isLabelLine(l) {
-  return LABEL_ONLY_RE.test(l) && l.split(/\s+/).length <= 3;
+  return LABEL_ONLY_RE.test(l) && l.split(/\s+/).length <= 3 && !DOC_TITLE_RE.test(l);
 }
 function isValueLine(l) {
-  return /\d/.test(l) && l.length <= 25 && l.split(/\s+/).length <= 3;
+  if (!/\d/.test(l) || l.length > 40 || l.split(/\s+/).length > 3) return false;
+  // Lange Werte gibt es nur am Stück ("306-7639612-1989933.TwQjFIZrB");
+  // sobald ein Leerzeichen drin ist, bleibt ein Wert kurz.
+  return l.length <= 25 || !/\s/.test(l);
 }
 
 function mergeLabelBlocks(lines) {
@@ -184,8 +191,10 @@ function mergeLabelBlocks(lines) {
 
     const labels = a - i;
     const values = b - a;
-    if (labels >= 2 && labels === values) {
+    if (labels >= 2 && values >= labels) {
       for (let k = 0; k < labels; k++) out.push(`${lines[i + k]} ${lines[a + k]}`);
+      // Überzählige Werte bleiben unverändert stehen
+      for (let k = labels; k < values; k++) out.push(lines[a + k]);
       i = b;
       continue;
     }
@@ -606,9 +615,14 @@ export function detectVatInfo(text, total = null) {
   // 6) Letzte Möglichkeit: Brutto − Netto. Nur übernehmen, wenn die Differenz
   //    genau einem gültigen Steuersatz entspricht (sonst ist es Zufall).
   if (total) {
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       if (!NET_LINE_RE.test(line) || VAT_KEY_SKIP.test(line)) continue;
-      for (const net of amountsOn(line)) {
+      let netto = amountsOn(line);
+      if (!netto.length && isMoneyLine(lines[i + 1] || '')) netto = amountsOn(lines[i + 1]);
+      for (const net of netto) {
+        // Netto und Brutto gleich hoch -> der Beleg enthält keine MwSt
+        if (net === total) return { value: 0, source: 'net-diff' };
         if (net >= total) continue;
         const v = round2(total - net);
         if (v > 0 && ratioLooksLikeVat(total, v)) return { value: v, source: 'net-diff' };
@@ -665,7 +679,7 @@ const RN_SKIP = new RegExp(
     // Adresse – eine Hausnummer ist nie die Belegnummer
     'stra(ß|ss)e', '\\bstr\\.', 'gasse\\b', '\\bplatz\\b', '\\bweg\\b', '\\bring\\b', '\\ballee\\b',
     // Sonstiges
-    'tracking', 'sendung', 'paket', '\\bplz\\b', 'postfach',
+    'tracking', 'sendung', 'paket', '\\bplz\\b', 'postfach', 'extern',
     'seite\\s*\\d', 'blatt', 'version'
   ].join('|'),
   'i'
@@ -689,7 +703,7 @@ function labelRegex(stems, requireNr) {
     .map(escapeRegex)
     .join('|');
   return new RegExp(
-    `\\b(?:${alt})s?${NR_WORD}${requireNr ? '' : '?'}(?![a-zäöüß])\\.?\\s*[:#]?\\s*(.*)$`,
+    `\\b(?:${alt})s?(${NR_WORD})${requireNr ? '' : '?'}(?![a-zäöüß])\\.?\\s*[:#]?\\s*(.*)$`,
     'i'
   );
 }
@@ -830,8 +844,13 @@ export function detectReceiptNumber(text) {
         // Starkes Label (Beleg/Rechnung): der Wert direkt dahinter zählt, auch
         // wenn vorne auf der Zeile z.B. "Kasse 2" steht.
         if (!tier.strong && RN_SKIP.test(lines[i])) continue;
-        const direct = grabNumber(m[1], minLen);
+        const direct = grabNumber(m[2], minLen);
         if (direct) return direct;
+        // "Rechnung" allein ist die Überschrift des Belegs, keine Bezeichnung
+        // für eine Nummer. Nur wenn "Nr"/"Nummer" dabeisteht, darf der Wert aus
+        // einer Folgezeile stammen - sonst wird die erste Zahl der Tabelle
+        // darunter zur Belegnummer erklärt.
+        if (!m[1]) continue;
         // Wert erst in der Folgezeile -> dann muss auch die Label-Zeile sauber sein
         if (RN_SKIP.test(lines[i])) continue;
         const next = valueFromNextLines(i);
@@ -859,11 +878,10 @@ export function detectReceiptNumber(text) {
   // Stufe 5: gar kein Label -> nur eindeutige Muster:
   // "#1234", Kürzel-Muster ("RE-2025-0012") oder geteilte Nummern ("2025/0001").
   // Reine Ziffernfolgen ohne Label bleiben bewusst außen vor.
-  for (const line of lines) {
-    if (RN_SKIP.test(line) || line.length > 60) continue;
-    const clean = stripRnNoise(line);
-    for (const re of [RN_HASH_RE, RN_DOCNUM_RE, RN_SPLITNUM_RE]) {
-      const m = clean.match(re);
+  for (const re of [RN_HASH_RE, RN_DOCNUM_RE, RN_SPLITNUM_RE]) {
+    for (const line of lines) {
+      if (RN_SKIP.test(line) || line.length > 60) continue;
+      const m = stripRnNoise(line).match(re);
       if (!m) continue;
       const v = m[1].replace(/\s/g, '').replace(/^[-/.]+|[-/.]+$/g, '');
       if (isUsableNumber(v)) return v;
@@ -956,23 +974,24 @@ const DATE_PATTERNS = [
  * Lieferdatum oder ein Zahlungsziel nicht das Rechnungsdatum überstimmt.
  * @param {number} maxAgeDays wie weit darf das Datum zurückliegen (Standard 3 Jahre)
  */
+// Erstes gueltiges Datum einer einzelnen Zeile (oder null).
+function dateOn(line, today, maxAgeDays) {
+  for (const { re, take } of DATE_PATTERNS) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      const parts = take(m);
+      if (!parts) continue;
+      const iso = buildDate(parts[0], parts[1], parts[2], today, maxAgeDays);
+      if (iso) return iso;
+    }
+  }
+  return null;
+}
+
 export function detectDate(text, today = new Date(), maxAgeDays = 3 * 365) {
   const lines = toLabelLines(text);
   if (!lines.length) return null;
-
-  const dateOn = (line) => {
-    for (const { re, take } of DATE_PATTERNS) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(line)) !== null) {
-        const parts = take(m);
-        if (!parts) continue;
-        const iso = buildDate(parts[0], parts[1], parts[2], today, maxAgeDays);
-        if (iso) return iso;
-      }
-    }
-    return null;
-  };
 
   // Durchgang 1-3: Zeilen mit Datums-Label, nach Priorität.
   // Durchgang 4: alle übrigen Zeilen (null = kein Label nötig).
@@ -980,11 +999,136 @@ export function detectDate(text, today = new Date(), maxAgeDays = 3 * 365) {
     for (const line of lines) {
       if (DATE_SKIP.test(line)) continue;
       if (label && !label.test(line)) continue;
-      const iso = dateOn(line);
+      const iso = dateOn(line, today, maxAgeDays);
       if (iso) return iso;
     }
   }
   return null;
+}
+
+// ---------- Amazon-Rechnungen ----------
+//
+// Amazon setzt Bezeichnung und Wert in zwei weit auseinanderliegende Spalten.
+// Die OCR liest erst alle Bezeichnungen und viel spaeter - nach Adressblock und
+// Kundenhinweis - die zugehoerigen Werte:
+//
+//   Rechnungsdatum              ... 25 Zeilen dazwischen ...
+//   /Lieferdatum        ->      17 August 2026
+//   Rechnungsnummer             DE60000N8RRUZI
+//   Zahlbetrag                  27,51 EUR
+//
+// Weder mergeLabelBlocks (die Bloecke liegen nicht nebeneinander, 4 Bezeichnungen
+// zu 3 Werten) noch die Suche nach dem Wert in der Folgezeile greifen hier.
+// Anker ist darum der Werte-Dreier selbst: Datum, Rechnungsnummer und Zahlbetrag
+// stehen immer genau in dieser Reihenfolge untereinander. Ohne diese Sonder-
+// behandlung hat der Bot das Bestelldatum (einen Tag zu frueh), ein Stueck der
+// Zahlungsreferenznummer und die Versandkosten statt des Zahlbetrags verbucht.
+
+// Kennzeichen des Amazon-Layouts. Bewusst NICHT das blosse Wort "Amazon":
+// "Zahlung ueber Amazon" steht auch auf fremden Rechnungen, deren Briefkopf den
+// echten Lieferanten nennt.
+const AMAZON_MARK_RE = /amazon\.[a-z]{2,3}(?:\.[a-z]{2})?\/contact-us|amazon\s+business/i;
+
+// Amazon-Rechnungsnummer: Laenderkuerzel, Ziffer, Block - und immer ein "I" am
+// Ende. Genau dieses "I" liest die OCR regelmaessig als "1" oder "l"
+// ("DE600MX7BF9C71"), deshalb wird der letzte Buchstabe hier zurechtgerueckt.
+const AMAZON_NO_RE = /^([A-Z]{2}\d[A-Z0-9]{5,15})[I1l]$/;
+const AMAZON_LABEL_ONLY_RE = /^[/]?\s*(?:rechnungsdatum|lieferdatum|rechnungsnummer|zahlbetrag)\s*:?$/i;
+const AMAZON_NO_LABEL_RE = /\brechnungsnummer\s+([A-Z]{2}\d[A-Z0-9]{6,16})\b/i;
+
+function amazonNumber(line) {
+  const roh = String(line || '').trim().replace(/[|]/g, 'I');
+  const m = roh.match(AMAZON_NO_RE);
+  return m ? m[1].toUpperCase() + 'I' : null;
+}
+
+/**
+ * MwSt einer Amazon-Rechnung.
+ * Lieferungen an unsere UID sind steuerfreie innergemeinschaftliche Lieferungen
+ * (0 %). Nur wenn kein einziger Satz ueber 0 ausgewiesen ist, wird 0 gesetzt -
+ * sonst uebernimmt die normale MwSt-Erkennung.
+ */
+const AMAZON_RATE_RE = /(?:^|[\s(])(\d{1,2})(?:[.,](\d{1,2}))?\s*%/g;
+
+function amazonVat(lines) {
+  let sahNull = false;
+  for (const l of lines) {
+    AMAZON_RATE_RE.lastIndex = 0;
+    let m;
+    while ((m = AMAZON_RATE_RE.exec(l)) !== null) {
+      const satz = parseFloat(m[2] ? m[1] + '.' + m[2] : m[1]);
+      if (isNaN(satz)) continue;
+      if (satz > 0) return null; // echte USt -> normale MwSt-Erkennung übernimmt
+      sahNull = true;
+    }
+  }
+  return sahNull ? 0 : null;
+}
+
+/**
+ * Rechnung im Amazon-Layout auswerten.
+ * @returns {{number:string,date:string|null,total:number|null,vat:number|null,count:number}|null}
+ *          count = Anzahl der Rechnungen im Dokument (Amazon legt mehrere
+ *          Rechnungen einer Bestellung in EIN PDF; dann zaehlt die Summe).
+ */
+export function detectAmazonInvoice(text, today = new Date(), maxAgeDays = 3 * 365) {
+  if (!AMAZON_MARK_RE.test(String(text || ''))) return null;
+  // Die OCR schiebt die Bezeichnungen mal komplett vor den Werteblock, mal
+  // mitten hinein ("Rechnungsdatum / /Lieferdatum / 01 September 2026 /
+  // Rechnungsnummer / DE60007M71RMFI / 24,23 EUR"). Ohne sie stehen die drei
+  // Werte in jedem Fall direkt untereinander.
+  const lines = toLines(text).filter((l) => !AMAZON_LABEL_ONLY_RE.test(l));
+
+  const blocks = [];
+  const gesehen = new Set();
+  for (let i = 0; i + 2 < lines.length; i++) {
+    const number = amazonNumber(lines[i + 1]);
+    if (!number || gesehen.has(number)) continue;
+    const date = dateOn(lines[i], today, maxAgeDays);
+    if (!date) continue;
+    if (!isMoneyLine(lines[i + 2])) continue;
+    const betraege = amountsOn(lines[i + 2]);
+    if (betraege.length !== 1) continue;
+    gesehen.add(number);
+    blocks.push({ number, date, total: betraege[0] });
+  }
+
+  if (!blocks.length) {
+    // Kein Werte-Dreier lesbar -> wenigstens die Nummer aus dem Seitenkopf
+    // ("Rechnungsnummer DE600MX7BF9C7I"), Betrag/Datum laufen normal weiter.
+    for (const line of lines) {
+      const m = line.match(AMAZON_NO_LABEL_RE);
+      const nr = m && amazonNumber(m[1]);
+      if (nr) return { number: nr, date: null, total: null, vat: null, count: 0 };
+    }
+    return null;
+  }
+
+  // Mehrere Rechnungen in einem PDF: der Beleg ist die Summe. Nummer und Datum
+  // kommen von der letzten Rechnung - das ist die, nach der Amazon das PDF benennt.
+  const letzte = blocks[blocks.length - 1];
+  return {
+    number: letzte.number,
+    date: letzte.date,
+    total: round2(blocks.reduce((sum, b) => sum + b.total, 0)),
+    vat: amazonVat(lines),
+    count: blocks.length
+  };
+}
+
+/**
+ * "Zahlung ueber Amazon", "Bezahlung per Amazon_bestellung", "(Amazon SKU: ...)":
+ * Zahlungshinweise auf FREMDEN Rechnungen. Sie duerfen den Lieferanten "Amazon"
+ * nicht ausloesen - dort steht der echte Lieferant im Briefkopf. Das Wort wird
+ * nur auf solchen Zeilen unkenntlich gemacht, der Rest der Zeile bleibt stehen.
+ */
+const AMAZON_NOTE_RE =
+  /(?:zahlung|bezahlung|bezahlt|zahlungsart|payment)[\s\S]{0,24}?amazon|amazon[\s_-]{0,3}(?:bestellung|bestellnummer|order|sku|marketplace|payments)/gi;
+
+export function stripAmazonPaymentNotes(text) {
+  return String(text || '').replace(AMAZON_NOTE_RE, (treffer) =>
+    treffer.replace(/amazon/gi, '~')
+  );
 }
 
 // ---------- Lieferant ----------
@@ -1029,6 +1173,8 @@ const DATE_LINE_RE = /\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b/;
 
 // "Firma GmbH, Straße 1, 1210 Wien" – Absenderzeile im Impressum-Fuß
 const FOOTER_SENDER_RE = /^([^,]{3,60}),\s*(.+)$/;
+// dieselbe Zeile, nur mit Strich oder Punkt statt Komma getrennt
+const FOOTER_SENDER_DASH_RE = /^(.{3,60}?)\s+[-–—·•]\s+(.+)$/;
 
 /**
  * Firmenname aus einer Zeile "Firma GmbH, Straße 1, 1210 Wien".
@@ -1063,7 +1209,9 @@ function senderFromBlock(lines, i) {
 }
 
 function senderFromCommaLine(line) {
-  const m = String(line || '').match(FOOTER_SENDER_RE);
+  const m =
+    String(line || '').match(FOOTER_SENDER_RE) ||
+    String(line || '').match(FOOTER_SENDER_DASH_RE);
   if (!m) return null;
   const firma = m[1].trim();
   const anschrift = m[2];

@@ -15,6 +15,8 @@ import {
   detectVatInfo,
   detectReceiptNumber,
   detectDate,
+  detectAmazonInvoice,
+  stripAmazonPaymentNotes,
   guessSupplierFromText,
   matchSupplier,
   supplierKeywords,
@@ -128,10 +130,29 @@ const OWN_COMPANY_WORDS = (process.env.OWN_COMPANY || 'zeytoon')
 
 // Wie verlässlich ist ein erkannter Wert? Höher = besser.
 // Wird gebraucht, um die Ergebnisse der zwei OCR-Verfahren zu vergleichen.
-const TOTAL_RANK = { 'keyword+cash': 6, keyword: 5, cash: 4, payment: 3, fallback: 1 };
-const VAT_RANK = { sum: 6, rates: 5, table: 4, 'keyword-sum': 3, keyword: 3, computed: 2, 'net-diff': 2 };
+const TOTAL_RANK = { amazon: 9, 'keyword+cash': 6, keyword: 5, cash: 4, payment: 3, fallback: 1 };
+const VAT_RANK = { amazon: 9, sum: 6, rates: 5, table: 4, 'keyword-sum': 3, keyword: 3, computed: 2, 'net-diff': 2 };
 
 function extractFrom(text) {
+  // Amazon-Rechnungen haben ein eigenes Layout, an dem die allgemeine Suche
+  // reihenweise scheitert (Bestelldatum statt Rechnungsdatum, Versandkosten
+  // statt Zahlbetrag, Zahlungsreferenz statt Rechnungsnummer). Steht der
+  // Kopfblock, kommen alle vier Werte von dort.
+  const amazon = detectAmazonInvoice(text);
+  if (amazon && amazon.total !== null) {
+    // MwSt nur übernehmen, wenn sie aus der Steuerübersicht ablesbar war
+    const vat = amazon.vat !== null ? { value: amazon.vat, source: 'amazon' } : detectVatInfo(text, amazon.total);
+    return {
+      total: amazon.total,
+      totalSource: 'amazon',
+      vat: vat.value,
+      vatSource: vat.source,
+      invoiceDate: amazon.date,
+      receiptNumber: amazon.number,
+      amazonCount: amazon.count
+    };
+  }
+
   // Reihenfolge wichtig: das Brutto dient der MwSt-Erkennung als Plausibilitätsgrenze
   const total = detectTotalInfo(text);
   const vat = detectVatInfo(text, total.value);
@@ -141,7 +162,8 @@ function extractFrom(text) {
     vat: vat.value,
     vatSource: vat.source,
     invoiceDate: detectDate(text),
-    receiptNumber: detectReceiptNumber(text)
+    receiptNumber: (amazon && amazon.number) || detectReceiptNumber(text),
+    amazonCount: 0
   };
 }
 
@@ -159,6 +181,7 @@ function bestExtraction(texts) {
     if ((TOTAL_RANK[c.totalSource] || 0) > (TOTAL_RANK[out.totalSource] || 0)) {
       out.total = c.total;
       out.totalSource = c.totalSource;
+      out.amazonCount = c.amazonCount;
       // MwSt hängt am Brutto -> gleich mitnehmen, sonst passen die beiden nicht zusammen
       if ((VAT_RANK[c.vatSource] || 0) >= (VAT_RANK[out.vatSource] || 0)) {
         out.vat = c.vat;
@@ -186,11 +209,21 @@ function bestExtraction(texts) {
 /** Lieferant über beide OCR-Lesarten suchen: erst bekannte Liste, dann frei lesen. */
 function findSupplier(texts) {
   const list = texts.filter((t) => t && t.trim());
-  for (const t of list) {
+
+  // Rechnung im Amazon-Vordruck: im Kopf steht der Marktplatz-Händler
+  // ("Verkauft von ..."), gebucht wird der Beleg aber auf Amazon.
+  if (list.some((t) => detectAmazonInvoice(t))) {
+    return { supplier: 'Amazon', guessed: false };
+  }
+
+  // Auf FREMDEN Rechnungen ist "Zahlung über Amazon" nur die Zahlungsart – der
+  // Lieferant steht im Briefkopf. Der Hinweis darf ihn nicht überstimmen.
+  const ohneHinweis = list.map(stripAmazonPaymentNotes);
+  for (const t of ohneHinweis) {
     const hit = matchSupplier(t, SUPPLIERS);
     if (hit) return { supplier: hit, guessed: false };
   }
-  for (const t of list) {
+  for (const t of ohneHinweis) {
     const hit = guessSupplierFromText(t, OWN_COMPANY_WORDS);
     if (hit) return { supplier: hit, guessed: true };
   }
@@ -913,6 +946,7 @@ async function handleIncomingFile(ctx, sid, items, meta) {
   session.vatSource = found.vatSource;
   session.invoiceDate = found.invoiceDate;
   session.receiptNumber = found.receiptNumber;
+  session.amazonCount = found.amazonCount || 0;
   console.log(
     `Erkannt: Brutto=${found.total} (${found.totalSource}) MwSt=${found.vat} (${found.vatSource}) ` +
     `Datum=${found.invoiceDate} Nr=${found.receiptNumber}`
@@ -1513,6 +1547,11 @@ function showReview(ctx, sid) {
   if (vatLooksOff(s.total, s.vat)) hints.push('MwSt passt rechnerisch nicht zum Brutto.');
   if (!s.invoiceDate) hints.push('Kein Datum erkannt – ohne Datum zählt der Beleg im aktuellen Monat.');
   if (!s.receiptNumber) hints.push('Keine Beleg-Nr. gefunden – der Dateiname endet dann auf „ohneNr".');
+  // Amazon legt mehrere Rechnungen einer Bestellung in EIN PDF – der Betrag ist
+  // dann die Summe. Das soll man sehen, bevor man bestätigt.
+  if (s.amazonCount > 1) {
+    hints.push(`${s.amazonCount} Rechnungen in diesem PDF – der Betrag ist die Summe.`);
+  }
 
   const kind = receiptKind(s.paymentMethod);
   const monthKey = s.invoiceDate ? s.invoiceDate.slice(0, 7) : monthKeyOf(new Date());
@@ -1844,7 +1883,7 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-08-20-detection-v7',
+    version: '2026-09-01-amazon-v8',
     features: [
       'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
       'receiptNr-v3', 'vat-v5', 'vat-multiline-rates', 'vat-repeated-rates',

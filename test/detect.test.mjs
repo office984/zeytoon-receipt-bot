@@ -7,6 +7,8 @@ import {
   detectVatInfo,
   detectReceiptNumber,
   detectDate,
+  detectAmazonInvoice,
+  stripAmazonPaymentNotes,
   guessSupplierFromText,
   matchSupplier,
   supplierKeywords,
@@ -1175,4 +1177,215 @@ Hauptstraße 1
 1010 Wien
 `;
   assert.equal(guessSupplierFromText(rg, ['zeytoon']), 'Musterhandel GmbH');
+});
+
+// ---------- Amazon-Rechnungen (Fehlerbelege 01.09.2026) ----------
+// 25 Amazon-Belege am Stueck falsch gelesen: Bestelldatum statt Rechnungsdatum,
+// Versandkosten statt Zahlbetrag, ein Stueck der Zahlungsreferenznummer statt
+// der Rechnungsnummer. Grund ist der zweispaltige Kopf, den die OCR zerreisst -
+// erst alle Bezeichnungen, dann 25 Zeilen spaeter die Werte.
+// Die Texte sind gekuerzte, aber zeilengetreue Auszuege der Google-Vision-Ausgabe.
+
+const AMAZON_HEUTE = new Date('2026-09-02T12:00:00Z');
+
+const AMAZON_EINZELN = `Rechnung
+Bezahlt
+Zahlungsreferenznummer 3bfEVi4VGPSaAkes3v8Z
+Verkauft von neimengguyizhunkejiyouxiangongsi
+USt-IDNr. DE367992052
+FIRMA ZEYTOON
+WIEN, 1030
+AT
+Rechnungsdatum
+/Lieferdatum
+Rechnungsnummer
+Zahlbetrag
+Um unseren Kundenservice zu kontaktieren, besuchen Sie www.amazon.de/contact-us
+Geschäftsadresse
+Zeytoon GmbH
+USt-IDNr. ATU77613478
+Lieferadresse
+Firma Zeytoon
+Bestellinformationen
+Bestelldatum
+Bestellnummer
+Auftraggeber
+16 August 2026
+306-1603025-9395556
+Firma IMEX-Business
+Rechnungsdetails
+Versandkosten
+Versendungsland: Deutschland
+17 August 2026
+DE60000N8RRUZI
+27,51 €
+Verkauft von
+neimengguyizhunkejiyouxiangongsi
+4167, #7), 0318%, 010000
+CN
+Menge
+Stückpreis (ohne USt.)
+USt. %
+Zwischensumme(inkl. USt.)
+1
+23,52 €
+0% (1)
+23,52 €
+3,99 €
+Gesamtpreis
+USt. Gesamt
+3,99 €
+27,51 €
+0%
+27,51 €
+0,00 €
+(1) Steuerfrei - Innergemeinschaftliche Lieferung - Artikel 138 Richtlinie 2006/112/EC
+Rechnung
+Rechnungsnummer DE60000N8RRUZI
+`;
+
+test('Amazon: Werte stehen weit unter ihren Bezeichnungen', () => {
+  const a = detectAmazonInvoice(AMAZON_EINZELN, AMAZON_HEUTE);
+  // frueher: 16.08. (Bestelldatum), 3,99 (Versandkosten), "bfEVi4" (Zahlungsreferenz)
+  assert.equal(a.date, '2026-08-17');
+  assert.equal(a.total, 27.51);
+  assert.equal(a.number, 'DE60000N8RRUZI');
+  assert.equal(a.count, 1);
+});
+
+test('Amazon: "0318%" in einer Absenderzeile ist kein Steuersatz', () => {
+  // Die Zeile "4167, #7), 0318%, 010000" hat frueher 18 % MwSt erzeugt (4,20 €)
+  assert.equal(detectAmazonInvoice(AMAZON_EINZELN, AMAZON_HEUTE).vat, 0);
+});
+
+test('Amazon: Bezeichnungen zwischen den Werten, "I" als "1" gelesen', () => {
+  const rg = `Rechnung
+Bezahlt
+Zahlungsreferenznummer 18lfVBDZYEshhqkmbHBy
+Verkauft von Shanghairongdijinchukoumaoyiyouxiangongsi
+Rechnungsdatum
+/Lieferdatum
+01 September 2026
+Rechnungsnummer
+DE60007M71RMF1
+24,23 €
+Zahlbetrag
+Um unseren Kundenservice zu kontaktieren, besuchen Sie www.amazon.de/contact-us
+0%
+24,23 €
+0,00 €
+`;
+  const a = detectAmazonInvoice(rg, AMAZON_HEUTE);
+  assert.equal(a.date, '2026-09-01');
+  assert.equal(a.total, 24.23);
+  // Amazon-Rechnungsnummern enden immer auf "I" - die OCR macht daraus gern "1"
+  assert.equal(a.number, 'DE60007M71RMFI');
+});
+
+test('Amazon: OCR liest das "I" auch als zwei Striche', () => {
+  const rg = `Rechnung
+Rechnungsdatum
+/Lieferdatum
+Rechnungsnummer
+Zahlbetrag
+23 August 2026
+CZ60019||GAKLI
+13,02 €
+Um unseren Kundenservice zu kontaktieren, besuchen Sie www.amazon.de/contact-us
+0%
+13,02 €
+`;
+  assert.equal(detectAmazonInvoice(rg, AMAZON_HEUTE).number, 'CZ60019IIGAKLI');
+});
+
+test('Amazon: mehrere Rechnungen in einem PDF werden addiert', () => {
+  const rg = `Rechnung
+Rechnungsdatum
+/Lieferdatum
+Rechnungsnummer
+Zahlbetrag
+24 August 2026
+CZ6006VT5DCKTI
+15,93 €
+Um unseren Kundenservice zu kontaktieren, besuchen Sie www.amazon.de/contact-us
+0%
+15,93 €
+Seite 1 von 2
+Rechnung
+Rechnungsdatum
+/Lieferdatum
+Rechnungsnummer
+Zahlbetrag
+24 August 2026
+CZ6000IDMTDGHI
+30,72 €
+Um unseren Kundenservice zu kontaktieren, besuchen Sie www.amazon.de/contact-us
+0%
+30,72 €
+`;
+  const a = detectAmazonInvoice(rg, AMAZON_HEUTE);
+  assert.equal(a.count, 2);
+  assert.equal(a.total, 46.65, 'Summe beider Rechnungen');
+  // Amazon benennt das PDF nach der letzten Rechnung
+  assert.equal(a.number, 'CZ6000IDMTDGHI');
+});
+
+test('Fremde Rechnung mit "Zahlung über Amazon" bleibt beim echten Lieferanten', () => {
+  const rg = `Aktobis AG, Borsigstr.20, D-63110 Rodgau
+Zeytoon Gmbh
+1030 Wien
+Rechnung
+Pos Produkt
+10
+WDH-870FW
+Zahlung über Amazon
+Rechnung Nr.
+Kunde Nr.
+Datum
+Auftrag Nr.
+Ihr Auftrag
+202618507
+279369
+14.08.2026
+238635
+306-7639612-1989933.TwQjFIZrB
+Nettobetrag
+336,84
+Umsatzsteuer 0% (Innergemeinschaftliche Lieferung)
+0,00
+Endbetrag EUR
+336,84
+`;
+  // kein Amazon-Vordruck -> der Briefkopf zaehlt
+  assert.equal(detectAmazonInvoice(rg), null);
+  const ohne = stripAmazonPaymentNotes(rg);
+  assert.equal(matchSupplier(ohne, [{ name: 'Amazon', keywords: ['amazon'] }]), null);
+  assert.equal(guessSupplierFromText(ohne, ['zeytoon']), 'Aktobis AG');
+  // frueher "10" - die Positionsnummer unter der Ueberschrift "Rechnung"
+  assert.equal(detectReceiptNumber(rg), '202618507');
+  assert.equal(detectDate(rg, AMAZON_HEUTE), '2026-08-14');
+});
+
+test('"(Amazon SKU: ...)" ueber zwei Zeilen zaehlt auch als Zahlungshinweis', () => {
+  const rg = `J. Lünemann GmbH - Am Bahnhof 13 · 46342 Velen
+Firma Zeytoon
+Rechnung
+Externe Auftragsnummer: 303-0452420-7504355
+Sambonet 52163-81 Leaf - 24 Teile (Amazon
+SKU: E0-3G7V-Z7H2)
+XRE-113785
+Beleg-Nr:
+Datum:
+26.08.2026
+Gesamt Netto
+108,99 €
+Rechnungsbetrag
+108,99 €
+`;
+  assert.equal(guessSupplierFromText(stripAmazonPaymentNotes(rg), ['zeytoon']), 'J. Lünemann GmbH');
+  // die externe Auftragsnummer ist die Amazon-Bestellnummer, nicht die Belegnummer
+  assert.equal(detectReceiptNumber(rg), 'XRE-113785');
+  const total = detectTotalInfo(rg);
+  assert.equal(total.value, 108.99);
+  assert.equal(detectVatInfo(rg, total.value).value, 0, 'Netto = Brutto -> keine MwSt');
 });
