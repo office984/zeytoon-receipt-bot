@@ -234,6 +234,29 @@ function findSupplier(texts) {
 // deutlich schlechter – und damit auch Stichwörter wie "Rückgeld" oder "Straße".
 const VISION_CONTEXT = { languageHints: ['de', 'en'] };
 
+// Letzter OCR-Fehlgriff – nur für /api/health, damit ein Ausfall der
+// Texterkennung sichtbar ist, ohne jeden Beleg einzeln zu prüfen.
+let LAST_OCR = { ok: null, reason: null, at: null };
+
+// OCR-Fehler in Klartext übersetzen. Wichtig: Ohne Vision-Text findet die
+// Erkennung nichts – der Bot muss den Grund sagen, statt stumm leer zu bleiben.
+function ocrProblemHinweis(ocrError) {
+  const e = String(ocrError || '');
+  if (/BILLING_DISABLED|requires billing/i.test(e)) {
+    return 'Die Texterkennung (Google Vision) ist gesperrt, weil im Google-Cloud-Projekt die *Abrechnung deaktiviert* ist. Bitte im Google-Konto die Zahlungsweise wieder aktivieren – danach liest der Bot Belege wieder automatisch.';
+  }
+  if (/API key not valid|API_KEY_INVALID|PERMISSION_DENIED|403/i.test(e)) {
+    return 'Die Texterkennung (Google Vision) wird abgelehnt – der API-Schlüssel ist ungültig oder gesperrt.';
+  }
+  if (/RESOURCE_EXHAUSTED|quota|429/i.test(e)) {
+    return 'Das Kontingent der Texterkennung (Google Vision) ist aufgebraucht.';
+  }
+  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up/i.test(e)) {
+    return 'Die Texterkennung war vorübergehend nicht erreichbar (Netzwerkproblem).';
+  }
+  return 'Die Texterkennung hat keinen Text geliefert.';
+}
+
 // OCR für Bilder über Google Vision REST API (mit API-Key).
 // Es werden BEIDE Verfahren angefragt:
 //   DOCUMENT_TEXT_DETECTION – besser bei dicht bedruckten Rechnungen (A4)
@@ -929,11 +952,30 @@ async function handleIncomingFile(ctx, sid, items, meta) {
 
   console.log(`OCR fertig – ${text.length} Zeichen erkannt (${pageCount} Seite(n))`);
 
+  // Kein Text erkannt -> Grund im Chat nennen. Sonst wirkt es so, als könnte der
+  // Bot den Beleg nicht lesen, obwohl in Wahrheit der Dienst ausgefallen ist.
+  if (!text || !text.trim()) {
+    await trackReply(
+      ctx,
+      session,
+      `⚠️ Vom Beleg konnte nichts gelesen werden.
+
+${ocrProblemHinweis(ocrError)}
+
+Ich frage die Werte jetzt Schritt für Schritt ab.`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    LAST_OCR = { ok: false, reason: ocrProblemHinweis(ocrError), at: new Date().toISOString() };
+    if (ocrError) console.error('OCR ohne Text – Grund:', ocrError);
+  }
+
   // Debug: Rohtext anzeigen, wenn DEBUG_OCR=true (wird NICHT auto-gelöscht)
   if (process.env.DEBUG_OCR === 'true') {
     const info = text && text.trim() ? text.slice(0, 3500) : `(KEIN Text)${ocrError ? '\nFehler: ' + ocrError : ''}`;
     await ctx.reply(`🔧 DEBUG OCR:\n\n${info}`);
   }
+
+  if (text && text.trim()) LAST_OCR = { ok: true, reason: null, at: new Date().toISOString() };
 
   session.extractedText = text;
   session.extractedTextAlt = altText;
@@ -1883,7 +1925,7 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-09-01-amazon-v8',
+    version: '2026-09-10-ocr-status-v1',
     features: [
       'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
       'receiptNr-v3', 'vat-v5', 'vat-multiline-rates', 'vat-repeated-rates',
@@ -1893,7 +1935,10 @@ app.get('/api/health', (req, res) => {
     ],
     firebase: FIREBASE_DB ? 'konfiguriert' : 'fehlt',
     suppliers: SUPPLIERS.length,
-    mode: usePolling ? 'polling' : 'webhook'
+    mode: usePolling ? 'polling' : 'webhook',
+    ocr: LAST_OCR.ok === null ? 'noch kein Beleg seit Start' : LAST_OCR.ok ? 'ok' : 'FEHLER',
+    ocrReason: LAST_OCR.reason,
+    ocrAt: LAST_OCR.at
   });
 });
 
