@@ -1413,7 +1413,8 @@ bot.action('payment_transfer', async (ctx) => {
           { text: 'N26', callback_data: 'transfer_n26' }
         ],
         [
-          { text: 'Viva', callback_data: 'transfer_viva' }
+          { text: 'Viva', callback_data: 'transfer_viva' },
+          { text: 'Finom', callback_data: 'transfer_finom' }
         ]
       ]
     }
@@ -1459,6 +1460,19 @@ bot.action('transfer_viva', async (ctx) => {
   await showReview(ctx, sid);
 });
 
+bot.action('transfer_finom', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Ueberwiesen_Finom';
+  session.account = 'Geschaeftskonto';
+  await showReview(ctx, sid);
+});
+
 bot.action('payment_card', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const sid = sidOf(ctx);
@@ -1475,7 +1489,8 @@ bot.action('payment_card', async (ctx) => {
           { text: 'N26', callback_data: 'card_n26' }
         ],
         [
-          { text: 'Viva', callback_data: 'card_viva' }
+          { text: 'Viva', callback_data: 'card_viva' },
+          { text: 'Finom', callback_data: 'card_finom' }
         ]
       ]
     }
@@ -1521,6 +1536,19 @@ bot.action('card_viva', async (ctx) => {
   await showReview(ctx, sid);
 });
 
+bot.action('card_finom', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const sid = sidOf(ctx);
+  const session = userSessions[sid];
+  if (!session) {
+    ctx.reply('❌ Sitzung abgelaufen');
+    return;
+  }
+  session.paymentMethod = 'Karte_Finom';
+  session.account = 'Geschaeftskonto';
+  await showReview(ctx, sid);
+});
+
 // ---------- Werte prüfen / korrigieren ----------
 function fmtAmount(n) {
   return typeof n === 'number' ? euro(n) : '—';
@@ -1544,9 +1572,11 @@ function prettyPayment(p) {
     Ueberwiesen_BAWAG: 'Überwiesen (BAWAG)',
     Ueberwiesen_N26: 'Überwiesen (N26)',
     Ueberwiesen_Viva: 'Überwiesen (Viva)',
+    Ueberwiesen_Finom: 'Überwiesen (Finom)',
     Karte_BAWAG: 'Karte (BAWAG)',
     Karte_N26: 'Karte (N26)',
-    Karte_Viva: 'Karte (Viva)'
+    Karte_Viva: 'Karte (Viva)',
+    Karte_Finom: 'Karte (Finom)'
   };
   return p ? map[p] || p.replace(/_/g, ' ') : '—';
 }
@@ -1925,9 +1955,9 @@ const usePolling =
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2026-09-10-ocr-status-v1',
+    version: '2026-09-17-finom-v1',
     features: [
-      'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva',
+      'ocr-dual', 'ocr-lang-de', 'crop', 'multipage', 'viva', 'finom',
       'receiptNr-v3', 'vat-v5', 'vat-multiline-rates', 'vat-repeated-rates',
       'vat-active-rates', 'vat-tax-free',
       'total-columns', 'total-payment-line', 'total-label-order', 'date-v2',
