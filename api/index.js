@@ -363,7 +363,7 @@ function generateFileName(data) {
   const date = data.date || new Date().toISOString().split('T')[0];
   const supplier = (data.supplier || 'unknown').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20);
   const payment = (data.paymentMethod || 'unknown').replace(/[^a-zA-Z0-9_]/g, '_');
-  // Statt Konto kommt die Beleg-Nr. ans Ende (Karte BAWAG/N26 bleibt im payment-Teil)
+  // Statt Konto kommt die Beleg-Nr. ans Ende (Karte N26/Viva/Finom bleibt im payment-Teil)
   const belegNr = (data.receiptNumber || 'ohneNr').replace(/[^a-zA-Z0-9]/g, '');
   return `${date}_${supplier}_${payment}_${belegNr}`;
 }
@@ -1409,29 +1409,13 @@ bot.action('payment_transfer', async (ctx) => {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: 'BAWAG', callback_data: 'transfer_bawag' },
-          { text: 'N26', callback_data: 'transfer_n26' }
-        ],
-        [
+          { text: 'N26', callback_data: 'transfer_n26' },
           { text: 'Viva', callback_data: 'transfer_viva' },
           { text: 'Finom', callback_data: 'transfer_finom' }
         ]
       ]
     }
   });
-});
-
-bot.action('transfer_bawag', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const sid = sidOf(ctx);
-  const session = userSessions[sid];
-  if (!session) {
-    ctx.reply('❌ Sitzung abgelaufen');
-    return;
-  }
-  session.paymentMethod = 'Ueberwiesen_BAWAG';
-  session.account = 'Geschaeftskonto';
-  await showReview(ctx, sid);
 });
 
 bot.action('transfer_n26', async (ctx) => {
@@ -1485,29 +1469,13 @@ bot.action('payment_card', async (ctx) => {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: 'BAWAG', callback_data: 'card_bawag' },
-          { text: 'N26', callback_data: 'card_n26' }
-        ],
-        [
+          { text: 'N26', callback_data: 'card_n26' },
           { text: 'Viva', callback_data: 'card_viva' },
           { text: 'Finom', callback_data: 'card_finom' }
         ]
       ]
     }
   });
-});
-
-bot.action('card_bawag', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  const sid = sidOf(ctx);
-  const session = userSessions[sid];
-  if (!session) {
-    ctx.reply('❌ Sitzung abgelaufen');
-    return;
-  }
-  session.paymentMethod = 'Karte_BAWAG';
-  session.account = 'Geschaeftskonto';
-  await showReview(ctx, sid);
 });
 
 bot.action('card_n26', async (ctx) => {
